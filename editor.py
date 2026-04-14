@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from audio_player import AudioPlayer
-from models import TranscriptDocument
+from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
 from pedal import FootPedalListener, PedalButton
 from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
 from vu_meter import AudioLevelProvider, VUMeter
