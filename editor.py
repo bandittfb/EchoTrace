@@ -5,16 +5,16 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPlainTextEdit,
     QPushButton,
     QSlider,
     QSplitter,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -179,6 +179,72 @@ class CorrectionEditor(QWidget):
 
         root.addLayout(vu_row)
 
+        # -- Formatting toolbar ----------------------------------------------
+        fmt_row = QHBoxLayout()
+        fmt_row.setSpacing(4)
+
+        self.btn_bold = QPushButton("B")
+        self.btn_bold.setToolTip("Bold (Ctrl+B)")
+        self.btn_bold.setCheckable(True)
+        self.btn_bold.setFixedSize(30, 26)
+        self.btn_bold.setStyleSheet(
+            f"QPushButton {{ font-weight: bold; font-size: 13px; font-family: 'Segoe UI'; }}"
+        )
+        fmt_row.addWidget(self.btn_bold)
+
+        self.btn_italic = QPushButton("I")
+        self.btn_italic.setToolTip("Italic (Ctrl+I)")
+        self.btn_italic.setCheckable(True)
+        self.btn_italic.setFixedSize(30, 26)
+        self.btn_italic.setStyleSheet(
+            f"QPushButton {{ font-style: italic; font-size: 13px; font-family: 'Segoe UI'; }}"
+        )
+        fmt_row.addWidget(self.btn_italic)
+
+        self.btn_underline = QPushButton("U")
+        self.btn_underline.setToolTip("Underline (Ctrl+U)")
+        self.btn_underline.setCheckable(True)
+        self.btn_underline.setFixedSize(30, 26)
+        self.btn_underline.setStyleSheet(
+            f"QPushButton {{ text-decoration: underline; font-size: 13px; font-family: 'Segoe UI'; }}"
+        )
+        fmt_row.addWidget(self.btn_underline)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedHeight(20)
+        sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        fmt_row.addWidget(sep)
+
+        self.btn_undo = QPushButton("↩ Undo")
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setMinimumWidth(60)
+        self.btn_undo.setFixedHeight(26)
+        fmt_row.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪ Redo")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setMinimumWidth(60)
+        self.btn_redo.setFixedHeight(26)
+        fmt_row.addWidget(self.btn_redo)
+
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setFixedHeight(20)
+        sep2.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        fmt_row.addWidget(sep2)
+
+        self.btn_clear_fmt = QPushButton("✕ Clear Format")
+        self.btn_clear_fmt.setToolTip("Remove formatting from selection")
+        self.btn_clear_fmt.setMinimumWidth(100)
+        self.btn_clear_fmt.setFixedHeight(26)
+        fmt_row.addWidget(self.btn_clear_fmt)
+
+        fmt_row.addStretch()
+        root.addLayout(fmt_row)
+
         # -- Main content: video (optional) + transcript ---------------------
         if self._is_video:
             splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -229,9 +295,10 @@ class CorrectionEditor(QWidget):
             transcript_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
             transcript_layout.addWidget(transcript_header)
 
-            self.text_edit = QPlainTextEdit()
+            self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
-            self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            self.text_edit.setAcceptRichText(True)
             transcript_layout.addWidget(self.text_edit, 1)
 
             splitter.addWidget(transcript_container)
@@ -242,13 +309,14 @@ class CorrectionEditor(QWidget):
             root.addWidget(splitter, 1)
         else:
             # Audio-only: just the transcript, full width
-            self.text_edit = QPlainTextEdit()
+            self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
-            self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            self.text_edit.setAcceptRichText(True)
             root.addWidget(self.text_edit, 1)
 
         # -- Hint bar --------------------------------------------------------
-        hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Click timestamp to seek"
+        hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Ctrl+B/I/U Format  |  Click timestamp to seek"
         if self._is_video:
             hint_text += "  |  Drag splitter to resize video"
         hint = QLabel(hint_text)
@@ -269,6 +337,15 @@ class CorrectionEditor(QWidget):
 
         self.text_edit.textChanged.connect(self._sync_text_to_model)
         self.text_edit.mouseReleaseEvent = self._on_text_click
+        self.text_edit.cursorPositionChanged.connect(self._update_format_buttons)
+
+        # Formatting toolbar
+        self.btn_bold.clicked.connect(self._toggle_bold)
+        self.btn_italic.clicked.connect(self._toggle_italic)
+        self.btn_underline.clicked.connect(self._toggle_underline)
+        self.btn_undo.clicked.connect(self.text_edit.undo)
+        self.btn_redo.clicked.connect(self.text_edit.redo)
+        self.btn_clear_fmt.clicked.connect(self._clear_formatting)
 
     def _register_hotkeys(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_F5), self, self.player.toggle, context=Qt.ShortcutContext.WindowShortcut)
@@ -342,6 +419,49 @@ class CorrectionEditor(QWidget):
             # 101-120: Red hot: #FF1744
             return "#FF1744"
 
+    # -- Formatting toolbar --------------------------------------------------
+
+    def _toggle_bold(self) -> None:
+        fmt = QTextCharFormat()
+        cursor = self.text_edit.textCursor()
+        current = cursor.charFormat().fontWeight()
+        is_bold = current >= QFont.Weight.Bold
+        fmt.setFontWeight(QFont.Weight.Normal if is_bold else QFont.Weight.Bold)
+        cursor.mergeCharFormat(fmt)
+        self.text_edit.mergeCurrentCharFormat(fmt)
+
+    def _toggle_italic(self) -> None:
+        fmt = QTextCharFormat()
+        cursor = self.text_edit.textCursor()
+        fmt.setFontItalic(not cursor.charFormat().fontItalic())
+        cursor.mergeCharFormat(fmt)
+        self.text_edit.mergeCurrentCharFormat(fmt)
+
+    def _toggle_underline(self) -> None:
+        fmt = QTextCharFormat()
+        cursor = self.text_edit.textCursor()
+        fmt.setFontUnderline(not cursor.charFormat().fontUnderline())
+        cursor.mergeCharFormat(fmt)
+        self.text_edit.mergeCurrentCharFormat(fmt)
+
+    def _clear_formatting(self) -> None:
+        """Remove all character formatting from the selection."""
+        cursor = self.text_edit.textCursor()
+        if not cursor.hasSelection():
+            return
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Weight.Normal)
+        fmt.setFontItalic(False)
+        fmt.setFontUnderline(False)
+        cursor.mergeCharFormat(fmt)
+
+    def _update_format_buttons(self) -> None:
+        """Keep B/I/U toggle states in sync with the cursor's current format."""
+        fmt = self.text_edit.textCursor().charFormat()
+        self.btn_bold.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
+        self.btn_italic.setChecked(fmt.fontItalic())
+        self.btn_underline.setChecked(fmt.fontUnderline())
+
     # -- VU Meter ------------------------------------------------------------
 
     def _precompute_levels(self) -> None:
@@ -366,7 +486,7 @@ class CorrectionEditor(QWidget):
     # -- Click to seek -------------------------------------------------------
 
     def _on_text_click(self, event) -> None:
-        QPlainTextEdit.mouseReleaseEvent(self.text_edit, event)
+        QTextEdit.mouseReleaseEvent(self.text_edit, event)
         cursor = self.text_edit.cursorForPosition(event.pos())
         col = cursor.positionInBlock()
 
