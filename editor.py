@@ -1,27 +1,33 @@
-"""Express Scribe-style correction editor for reviewing AI transcripts."""
+"""Express Scribe-style correction editor with optional video panel."""
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCursor
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from audio_player import AudioPlayer
 from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
-from theme import ACCENT, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_SECONDARY, TEXT_SPEAKER, TEXT_TIMESTAMP
+from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_SECONDARY, TEXT_TIMESTAMP
 
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
 SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 
 class CorrectionEditor(QWidget):
-    """Two-panel editor: transport controls + editable transcript."""
+    """Transport controls + optional video + editable transcript."""
 
     def __init__(self, document: TranscriptDocument, parent=None) -> None:
         super().__init__(parent)
@@ -29,6 +35,7 @@ class CorrectionEditor(QWidget):
         self.player = AudioPlayer(self)
         self._current_seg_idx = -1
         self._block_sync = False
+        self._is_video = self._detect_video()
 
         self._build_ui()
         self._connect_signals()
@@ -37,6 +44,11 @@ class CorrectionEditor(QWidget):
 
         if self.doc.audio_path:
             self.player.load(str(self.doc.audio_path))
+
+    def _detect_video(self) -> bool:
+        if self.doc.audio_path:
+            return self.doc.audio_path.suffix.lower() in VIDEO_EXTS
+        return False
 
     # -- UI construction -----------------------------------------------------
 
@@ -108,14 +120,79 @@ class CorrectionEditor(QWidget):
 
         root.addLayout(speed_row)
 
-        # -- Transcript text -------------------------------------------------
-        self.text_edit = QPlainTextEdit()
-        self.text_edit.setFont(QFont("Consolas", 11))
-        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        root.addWidget(self.text_edit, 1)
+        # -- Main content: video (optional) + transcript ---------------------
+        if self._is_video:
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            splitter.setHandleWidth(6)
+            splitter.setStyleSheet(f"""
+                QSplitter::handle {{
+                    background-color: #2A2A4A;
+                    border-radius: 3px;
+                }}
+                QSplitter::handle:hover {{
+                    background-color: {ACCENT};
+                }}
+            """)
+
+            # Video panel
+            video_container = QWidget()
+            video_layout = QVBoxLayout(video_container)
+            video_layout.setContentsMargins(0, 0, 0, 0)
+            video_layout.setSpacing(4)
+
+            video_header = QLabel("VIDEO")
+            video_header.setStyleSheet(
+                f"font-size: 9px; font-weight: bold; color: {TEXT_SECONDARY}; "
+                f"letter-spacing: 2px; padding: 2px 0;"
+            )
+            video_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            video_layout.addWidget(video_header)
+
+            self._video_widget = QVideoWidget()
+            self._video_widget.setMinimumSize(320, 240)
+            self._video_widget.setStyleSheet(f"background-color: black; border-radius: 4px;")
+            video_layout.addWidget(self._video_widget, 1)
+
+            self.player.set_video_output(self._video_widget)
+            splitter.addWidget(video_container)
+
+            # Transcript panel
+            transcript_container = QWidget()
+            transcript_layout = QVBoxLayout(transcript_container)
+            transcript_layout.setContentsMargins(0, 0, 0, 0)
+            transcript_layout.setSpacing(4)
+
+            transcript_header = QLabel("TRANSCRIPT")
+            transcript_header.setStyleSheet(
+                f"font-size: 9px; font-weight: bold; color: {TEXT_SECONDARY}; "
+                f"letter-spacing: 2px; padding: 2px 0;"
+            )
+            transcript_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            transcript_layout.addWidget(transcript_header)
+
+            self.text_edit = QPlainTextEdit()
+            self.text_edit.setFont(QFont("Consolas", 11))
+            self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            transcript_layout.addWidget(self.text_edit, 1)
+
+            splitter.addWidget(transcript_container)
+
+            # Default split: 45% video, 55% transcript
+            splitter.setSizes([450, 550])
+
+            root.addWidget(splitter, 1)
+        else:
+            # Audio-only: just the transcript, full width
+            self.text_edit = QPlainTextEdit()
+            self.text_edit.setFont(QFont("Consolas", 11))
+            self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            root.addWidget(self.text_edit, 1)
 
         # -- Hint bar --------------------------------------------------------
-        hint = QLabel("F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Click timestamp to seek")
+        hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Click timestamp to seek"
+        if self._is_video:
+            hint_text += "  |  Drag splitter to resize video"
+        hint = QLabel(hint_text)
         hint.setObjectName("hint")
         root.addWidget(hint)
 
@@ -164,9 +241,21 @@ class CorrectionEditor(QWidget):
             bracket_end = line.find("]")
             if bracket_end != -1:
                 rest = line[bracket_end + 1:].strip()
-                if self.doc.segments[i].speaker and rest.startswith(self.doc.segments[i].speaker + ":"):
-                    rest = rest[len(self.doc.segments[i].speaker) + 1:].strip()
-                self.doc.segments[i].text = rest
+                # Parse "SpeakerName: text" — everything before first ":" is speaker
+                colon_pos = rest.find(":")
+                if colon_pos != -1:
+                    potential_speaker = rest[:colon_pos].strip()
+                    # Only treat as speaker if it looks like a name (not too long,
+                    # no line-like content). Speaker names are typically short labels.
+                    if 1 <= len(potential_speaker) <= 40 and "\n" not in potential_speaker:
+                        self.doc.segments[i].speaker = potential_speaker
+                        self.doc.segments[i].text = rest[colon_pos + 1:].strip()
+                    else:
+                        self.doc.segments[i].text = rest
+                else:
+                    # No colon — no speaker label, just text
+                    self.doc.segments[i].speaker = ""
+                    self.doc.segments[i].text = rest
 
     # -- Click to seek -------------------------------------------------------
 

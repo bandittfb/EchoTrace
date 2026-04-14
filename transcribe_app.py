@@ -31,6 +31,7 @@ from exporters import export_docx, export_json, export_pdf, export_txt
 from models import Segment, TranscriptDocument
 from theme import APP_NAME, APP_SUBTITLE, STYLESHEET
 from transcriber import TranscriberWorker
+from waiting_widget import WaitingWidget
 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".mp4", ".mkv", ".webm"}
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
@@ -107,11 +108,14 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._doc = None
         self._editor = None
+        self._project_path = None
 
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
+        self._segment_count = 0
 
         self._build_phase1()
+        self._build_waiting_screen()
         self._build_phase2_placeholder()
 
     # -- Phase 1 UI ----------------------------------------------------------
@@ -157,10 +161,15 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(10)
 
-        self.btn_browse = QPushButton("Browse...")
-        self.btn_browse.setFixedWidth(110)
+        self.btn_browse = QPushButton("Browse Audio...")
+        self.btn_browse.setFixedWidth(130)
         self.btn_browse.clicked.connect(self._browse)
         controls.addWidget(self.btn_browse)
+
+        self.btn_open_project = QPushButton("Open Project...")
+        self.btn_open_project.setFixedWidth(130)
+        self.btn_open_project.clicked.connect(self._open_project)
+        controls.addWidget(self.btn_open_project)
 
         model_label = QLabel("Model:")
         model_label.setFixedWidth(45)
@@ -185,23 +194,22 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
         layout.addSpacing(8)
 
-        # Progress
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setFormat("%p% — %v of 100")
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
         self.lbl_status = QLabel("Ready — drop a file or click Browse to begin.")
         self.lbl_status.setObjectName("hint")
         layout.addWidget(self.lbl_status)
 
-        self._stack.addWidget(page)
+        self._stack.addWidget(page)  # index 0
+
+    def _build_waiting_screen(self) -> None:
+        logo_pixmap = None
+        if LOGO_PATH.exists():
+            logo_pixmap = _circular_pixmap(QPixmap(str(LOGO_PATH)), 140)
+        self._waiting = WaitingWidget(logo_pixmap, self)
+        self._stack.addWidget(self._waiting)  # index 1
 
     def _build_phase2_placeholder(self) -> None:
         self._phase2_page = QWidget()
-        self._stack.addWidget(self._phase2_page)
+        self._stack.addWidget(self._phase2_page)  # index 2
 
     def _toggle_diarize(self) -> None:
         on = self.btn_diarize.isChecked()
@@ -217,12 +225,70 @@ class MainWindow(QMainWindow):
         if path:
             self._start_transcription(path)
 
+    def _open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open EchoTrace project", "", "EchoTrace projects (*.echotrace);;All (*.*)"
+        )
+        if path:
+            try:
+                self._doc = TranscriptDocument.load_json(Path(path))
+                self._project_path = Path(path)
+
+                # Check if the original media file still exists
+                if self._doc.audio_path and not self._doc.audio_path.exists():
+                    reply = QMessageBox.question(
+                        self,
+                        "Media file not found",
+                        f"The original file was at:\n{self._doc.audio_path}\n\n"
+                        f"It has been moved or deleted. Would you like to locate it?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        ext_str = " ".join(f"*{e}" for e in AUDIO_EXTS)
+                        new_path, _ = QFileDialog.getOpenFileName(
+                            self, "Locate media file", "",
+                            f"Audio/Video ({ext_str});;All (*.*)",
+                        )
+                        if new_path:
+                            self._doc.audio_path = Path(new_path)
+                        else:
+                            # User cancelled — open transcript-only (no playback)
+                            self._doc.audio_path = None
+                    else:
+                        # Open transcript-only (no playback)
+                        self._doc.audio_path = None
+
+                self._open_editor()
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", str(e))
+
+    def _save_project(self) -> None:
+        if not self._doc:
+            return
+        if self._editor:
+            self._editor._sync_text_to_model()
+        # Default save path: same folder as audio, or last project path
+        if hasattr(self, "_project_path") and self._project_path:
+            default = str(self._project_path)
+        elif self._doc.audio_path:
+            default = str(self._doc.audio_path.with_suffix(".echotrace"))
+        else:
+            default = "transcript.echotrace"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save EchoTrace project", default, "EchoTrace projects (*.echotrace)"
+        )
+        if path:
+            try:
+                self._doc.save_json(Path(path))
+                self._project_path = Path(path)
+                QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", str(e))
+
     def _start_transcription(self, path: str) -> None:
-        self.progress.setVisible(True)
-        self.progress.setValue(0)
-        self.btn_browse.setEnabled(False)
-        self.drop_zone.setAcceptDrops(False)
-        self.lbl_status.setText(f"Processing: {Path(path).name}")
+        self._segment_count = 0
+        self._waiting.start()
+        self._stack.setCurrentWidget(self._waiting)
 
         self._audio_path = path
         self._worker = TranscriberWorker(
@@ -238,26 +304,26 @@ class MainWindow(QMainWindow):
 
     @Slot(int, str)
     def _on_progress(self, pct: int, msg: str) -> None:
-        self.progress.setValue(pct)
-        self.progress.setFormat(f"{pct}% — {msg}")
-        self.lbl_status.setText(msg)
+        # Count segments from the transcription percentage (0-70% range)
+        if pct > 5 and pct < 70:
+            self._segment_count += 1
+        self._waiting.update_progress(pct, msg, self._segment_count)
 
     @Slot(list)
     def _on_finished(self, segments: list[Segment]) -> None:
+        self._waiting.stop()
         self._doc = TranscriptDocument(
             segments=segments,
             audio_path=Path(self._audio_path),
             model_size=self.combo_model.currentText(),
             created_at=datetime.now().isoformat(),
         )
-        self.lbl_status.setText(f"Complete — {len(segments)} segments. Opening editor...")
         self._open_editor()
 
     @Slot(str)
     def _on_error(self, msg: str) -> None:
-        self.progress.setVisible(False)
-        self.btn_browse.setEnabled(True)
-        self.drop_zone.setAcceptDrops(True)
+        self._waiting.stop()
+        self._stack.setCurrentIndex(0)
         self.lbl_status.setText(f"Error: {msg}")
         QMessageBox.critical(self, "Transcription Error", msg)
 
@@ -288,6 +354,11 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(lbl_file)
 
         top_bar.addStretch()
+
+        btn_save = QPushButton("Save Project")
+        btn_save.setObjectName("exportBtn")
+        btn_save.clicked.connect(self._save_project)
+        top_bar.addWidget(btn_save)
 
         btn_new = QPushButton("New File")
         btn_new.clicked.connect(self._back_to_phase1)
@@ -324,11 +395,17 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentWidget(page)
 
     def _back_to_phase1(self) -> None:
+        reply = QMessageBox.question(
+            self, "Save project?",
+            "Do you want to save your project before starting a new file?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Cancel:
+            return
+        if reply == QMessageBox.StandardButton.Yes:
+            self._save_project()
+
         self._stack.setCurrentIndex(0)
-        self.progress.setVisible(False)
-        self.progress.setValue(0)
-        self.btn_browse.setEnabled(True)
-        self.drop_zone.setAcceptDrops(True)
         self.lbl_status.setText("Ready — drop a file or click Browse to begin.")
         if self._editor:
             self._editor.player.pause()
@@ -378,6 +455,13 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    import warnings
+    import os
+    # Suppress torchcodec warnings globally (broken on Windows, pyannote falls back to torchaudio)
+    os.environ["TORCHCODEC_DISABLE_LOAD"] = "1"
+    warnings.filterwarnings("ignore", message=".*torchcodec.*")
+    warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
