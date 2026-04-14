@@ -276,31 +276,38 @@ class CorrectionEditor(QWidget):
         row.setSpacing(4)
         row.setContentsMargins(0, 0, 0, 0)
 
-        bold_font = QFont("Segoe UI", 10)
+        # Small square buttons need reduced padding; global theme's
+        # 6px 14px would clip the single-letter label.
+        compact_css = "QPushButton { padding: 2px; min-width: 0; font-size: 13px; }"
+
+        bold_font = QFont("Segoe UI", 11)
         bold_font.setBold(True)
         self.btn_bold = QPushButton("B")
         self.btn_bold.setToolTip("Bold (Ctrl+B)")
         self.btn_bold.setCheckable(True)
-        self.btn_bold.setFixedSize(30, 26)
+        self.btn_bold.setFixedSize(32, 26)
         self.btn_bold.setFont(bold_font)
+        self.btn_bold.setStyleSheet(compact_css)
         row.addWidget(self.btn_bold)
 
-        italic_font = QFont("Segoe UI", 10)
+        italic_font = QFont("Segoe UI", 11)
         italic_font.setItalic(True)
         self.btn_italic = QPushButton("I")
         self.btn_italic.setToolTip("Italic (Ctrl+I)")
         self.btn_italic.setCheckable(True)
-        self.btn_italic.setFixedSize(30, 26)
+        self.btn_italic.setFixedSize(32, 26)
         self.btn_italic.setFont(italic_font)
+        self.btn_italic.setStyleSheet(compact_css)
         row.addWidget(self.btn_italic)
 
-        underline_font = QFont("Segoe UI", 10)
+        underline_font = QFont("Segoe UI", 11)
         underline_font.setUnderline(True)
         self.btn_underline = QPushButton("U")
         self.btn_underline.setToolTip("Underline (Ctrl+U)")
         self.btn_underline.setCheckable(True)
-        self.btn_underline.setFixedSize(30, 26)
+        self.btn_underline.setFixedSize(32, 26)
         self.btn_underline.setFont(underline_font)
+        self.btn_underline.setStyleSheet(compact_css)
         row.addWidget(self.btn_underline)
 
         sep = QFrame()
