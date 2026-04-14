@@ -179,72 +179,6 @@ class CorrectionEditor(QWidget):
 
         root.addLayout(vu_row)
 
-        # -- Formatting toolbar ----------------------------------------------
-        fmt_row = QHBoxLayout()
-        fmt_row.setSpacing(4)
-
-        self.btn_bold = QPushButton("B")
-        self.btn_bold.setToolTip("Bold (Ctrl+B)")
-        self.btn_bold.setCheckable(True)
-        self.btn_bold.setFixedSize(30, 26)
-        self.btn_bold.setStyleSheet(
-            f"QPushButton {{ font-weight: bold; font-size: 13px; font-family: 'Segoe UI'; }}"
-        )
-        fmt_row.addWidget(self.btn_bold)
-
-        self.btn_italic = QPushButton("I")
-        self.btn_italic.setToolTip("Italic (Ctrl+I)")
-        self.btn_italic.setCheckable(True)
-        self.btn_italic.setFixedSize(30, 26)
-        self.btn_italic.setStyleSheet(
-            f"QPushButton {{ font-style: italic; font-size: 13px; font-family: 'Segoe UI'; }}"
-        )
-        fmt_row.addWidget(self.btn_italic)
-
-        self.btn_underline = QPushButton("U")
-        self.btn_underline.setToolTip("Underline (Ctrl+U)")
-        self.btn_underline.setCheckable(True)
-        self.btn_underline.setFixedSize(30, 26)
-        self.btn_underline.setStyleSheet(
-            f"QPushButton {{ text-decoration: underline; font-size: 13px; font-family: 'Segoe UI'; }}"
-        )
-        fmt_row.addWidget(self.btn_underline)
-
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFixedHeight(20)
-        sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        fmt_row.addWidget(sep)
-
-        self.btn_undo = QPushButton("↩ Undo")
-        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
-        self.btn_undo.setMinimumWidth(60)
-        self.btn_undo.setFixedHeight(26)
-        fmt_row.addWidget(self.btn_undo)
-
-        self.btn_redo = QPushButton("↪ Redo")
-        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
-        self.btn_redo.setMinimumWidth(60)
-        self.btn_redo.setFixedHeight(26)
-        fmt_row.addWidget(self.btn_redo)
-
-        # Separator
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setFixedHeight(20)
-        sep2.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        fmt_row.addWidget(sep2)
-
-        self.btn_clear_fmt = QPushButton("✕ Clear Format")
-        self.btn_clear_fmt.setToolTip("Remove formatting from selection")
-        self.btn_clear_fmt.setMinimumWidth(100)
-        self.btn_clear_fmt.setFixedHeight(26)
-        fmt_row.addWidget(self.btn_clear_fmt)
-
-        fmt_row.addStretch()
-        root.addLayout(fmt_row)
-
         # -- Main content: video (optional) + transcript ---------------------
         if self._is_video:
             splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -287,13 +221,18 @@ class CorrectionEditor(QWidget):
             transcript_layout.setContentsMargins(0, 0, 0, 0)
             transcript_layout.setSpacing(4)
 
+            # Header row: TRANSCRIPT label on left, formatting toolbar on right
+            header_row = QHBoxLayout()
+            header_row.setContentsMargins(0, 0, 0, 0)
             transcript_header = QLabel("TRANSCRIPT")
             transcript_header.setStyleSheet(
                 f"font-size: 9px; font-weight: bold; color: {TEXT_SECONDARY}; "
                 f"letter-spacing: 2px; padding: 2px 0;"
             )
-            transcript_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            transcript_layout.addWidget(transcript_header)
+            header_row.addWidget(transcript_header)
+            header_row.addStretch()
+            header_row.addLayout(self._build_format_toolbar())
+            transcript_layout.addLayout(header_row)
 
             self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
@@ -308,7 +247,13 @@ class CorrectionEditor(QWidget):
 
             root.addWidget(splitter, 1)
         else:
-            # Audio-only: just the transcript, full width
+            # Audio-only: toolbar on right, transcript full width below
+            toolbar_row = QHBoxLayout()
+            toolbar_row.setContentsMargins(0, 0, 0, 0)
+            toolbar_row.addStretch()
+            toolbar_row.addLayout(self._build_format_toolbar())
+            root.addLayout(toolbar_row)
+
             self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
             self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
@@ -322,6 +267,73 @@ class CorrectionEditor(QWidget):
         hint = QLabel(hint_text)
         hint.setObjectName("hint")
         root.addWidget(hint)
+
+    def _build_format_toolbar(self) -> QHBoxLayout:
+        """Build the B/I/U + Undo/Redo/Clear toolbar. Uses QFont on the buttons
+        so the theme's button text colour still applies (stylesheet-based
+        font styling was rendering blank buttons)."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.setContentsMargins(0, 0, 0, 0)
+
+        bold_font = QFont("Segoe UI", 10)
+        bold_font.setBold(True)
+        self.btn_bold = QPushButton("B")
+        self.btn_bold.setToolTip("Bold (Ctrl+B)")
+        self.btn_bold.setCheckable(True)
+        self.btn_bold.setFixedSize(30, 26)
+        self.btn_bold.setFont(bold_font)
+        row.addWidget(self.btn_bold)
+
+        italic_font = QFont("Segoe UI", 10)
+        italic_font.setItalic(True)
+        self.btn_italic = QPushButton("I")
+        self.btn_italic.setToolTip("Italic (Ctrl+I)")
+        self.btn_italic.setCheckable(True)
+        self.btn_italic.setFixedSize(30, 26)
+        self.btn_italic.setFont(italic_font)
+        row.addWidget(self.btn_italic)
+
+        underline_font = QFont("Segoe UI", 10)
+        underline_font.setUnderline(True)
+        self.btn_underline = QPushButton("U")
+        self.btn_underline.setToolTip("Underline (Ctrl+U)")
+        self.btn_underline.setCheckable(True)
+        self.btn_underline.setFixedSize(30, 26)
+        self.btn_underline.setFont(underline_font)
+        row.addWidget(self.btn_underline)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedHeight(20)
+        sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        row.addWidget(sep)
+
+        self.btn_undo = QPushButton("↩ Undo")
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setMinimumWidth(70)
+        self.btn_undo.setFixedHeight(26)
+        row.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪ Redo")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setMinimumWidth(70)
+        self.btn_redo.setFixedHeight(26)
+        row.addWidget(self.btn_redo)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setFixedHeight(20)
+        sep2.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        row.addWidget(sep2)
+
+        self.btn_clear_fmt = QPushButton("✕ Clear")
+        self.btn_clear_fmt.setToolTip("Remove formatting from selection")
+        self.btn_clear_fmt.setMinimumWidth(70)
+        self.btn_clear_fmt.setFixedHeight(26)
+        row.addWidget(self.btn_clear_fmt)
+
+        return row
 
     def _connect_signals(self) -> None:
         self.btn_play.clicked.connect(self.player.toggle)
