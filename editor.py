@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from audio_player import AudioPlayer
-from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
+from models import TranscriptDocument
+from pedal import FootPedalListener, PedalButton
 from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
 from vu_meter import AudioLevelProvider, VUMeter
 
@@ -85,6 +86,13 @@ class CorrectionEditor(QWidget):
         self._vu_timer.setInterval(50)
         self._vu_timer.timeout.connect(self._update_vu)
         self._vu_timer.start()
+
+        # Start foot pedal listener
+        self._pedal = FootPedalListener(self)
+        self._pedal.pressed.connect(self._on_pedal_pressed)
+        self._pedal.connected.connect(self._on_pedal_connected)
+        self._pedal.disconnected.connect(self._on_pedal_disconnected)
+        self._pedal.start()
 
     def _detect_video(self) -> bool:
         if self.doc.audio_path:
@@ -261,12 +269,25 @@ class CorrectionEditor(QWidget):
             root.addWidget(self.text_edit, 1)
 
         # -- Hint bar --------------------------------------------------------
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+
         hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Ctrl+B/I/U Format  |  Click timestamp to seek"
         if self._is_video:
             hint_text += "  |  Drag splitter to resize video"
         hint = QLabel(hint_text)
         hint.setObjectName("hint")
-        root.addWidget(hint)
+        hint_row.addWidget(hint)
+
+        hint_row.addStretch()
+
+        # Foot pedal status indicator
+        self.lbl_pedal = QLabel("○ Pedal scanning…")
+        self.lbl_pedal.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
+        self.lbl_pedal.setToolTip("Scanning for a connected USB foot pedal…")
+        hint_row.addWidget(self.lbl_pedal)
+
+        root.addLayout(hint_row)
 
     def _build_format_toolbar(self) -> QHBoxLayout:
         """Build the B/I/U + Undo/Redo/Clear toolbar. Uses QFont on the buttons
@@ -480,6 +501,45 @@ class CorrectionEditor(QWidget):
         self.btn_bold.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
         self.btn_italic.setChecked(fmt.fontItalic())
         self.btn_underline.setChecked(fmt.fontUnderline())
+
+    # -- Foot pedal ---------------------------------------------------------
+
+    def _on_pedal_pressed(self, button: int) -> None:
+        """Default Express Scribe mapping: L=rewind, C=play/pause, R=forward."""
+        if button == PedalButton.LEFT:
+            self.player.rewind(5000)
+        elif button == PedalButton.CENTER:
+            self.player.toggle()
+        elif button == PedalButton.RIGHT:
+            self.player.forward(5000)
+
+    def _on_pedal_connected(self, name: str) -> None:
+        if hasattr(self, "lbl_pedal"):
+            self.lbl_pedal.setText(f"● Pedal: {name}")
+            self.lbl_pedal.setStyleSheet(
+                f"color: #00E676; font-size: 10px; font-weight: bold;"
+            )
+            self.lbl_pedal.setToolTip(
+                "Foot pedal connected.\n"
+                "Left = Rewind 5s  |  Center = Play/Pause  |  Right = Forward 5s"
+            )
+
+    def _on_pedal_disconnected(self) -> None:
+        if hasattr(self, "lbl_pedal"):
+            self.lbl_pedal.setText("○ No pedal")
+            self.lbl_pedal.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 10px;"
+            )
+            self.lbl_pedal.setToolTip(
+                "No foot pedal detected.\n"
+                "Supported: VEC Infinity USB Foot Pedal.\n"
+                "Plug it into any USB port — Windows will recognize it automatically."
+            )
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "_pedal"):
+            self._pedal.stop()
+        super().closeEvent(event)
 
     # -- VU Meter ------------------------------------------------------------
 

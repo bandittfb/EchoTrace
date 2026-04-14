@@ -18,7 +18,7 @@ Built for private investigators, law enforcement, legal professionals, and anyon
 - **Speaker Detection** — Automatic speaker diarization via [pyannote.audio](https://github.com/pyannote/pyannote-audio). Labels each voice as Speaker 1, Speaker 2, etc.
 - **Built-in Video Player** — Side-by-side video and transcript for body cam, interview, and surveillance footage. Resizable split panel.
 - **Express Scribe-Style Editor** — Play/pause/rewind with hotkeys (F5/F6/F7), variable speed (0.5x–2.0x), click-to-seek on timestamps, and inline text editing.
-- **Foot Pedal Support** — Works with USB foot pedals mapped to F5/F6/F7.
+- **Foot Pedal Support** — Native integration with the VEC Infinity USB Foot Pedal (auto-detected on startup). Left = Rewind 5s · Center = Play/Pause · Right = Forward 5s. No drivers to install — just plug it in.
 - **Speaker Name Editing** — Rename "Speaker 1" to "Officer Smith" directly in the transcript. Edits persist through save/load.
 - **Project Save/Load** — Save your work as `.echotrace` files and resume editing later.
 - **Multiple Export Formats** — Export corrected transcripts to TXT, DOCX, JSON, or PDF.
