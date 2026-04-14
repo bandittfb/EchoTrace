@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCursor
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 
 from audio_player import AudioPlayer
 from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
-from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_SECONDARY, TEXT_TIMESTAMP
+from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
+from vu_meter import AudioLevelProvider, VUMeter
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
 SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -66,6 +67,8 @@ class CorrectionEditor(QWidget):
         self._current_seg_idx = -1
         self._block_sync = False
         self._is_video = self._detect_video()
+        self._volume_pct = 80  # default 80%
+        self._level_provider = AudioLevelProvider()
 
         self._build_ui()
         self._connect_signals()
@@ -74,6 +77,14 @@ class CorrectionEditor(QWidget):
 
         if self.doc.audio_path:
             self.player.load(str(self.doc.audio_path))
+            # Pre-compute audio levels in background
+            self._precompute_levels()
+
+        # VU meter refresh timer (50ms = 20fps)
+        self._vu_timer = QTimer(self)
+        self._vu_timer.setInterval(50)
+        self._vu_timer.timeout.connect(self._update_vu)
+        self._vu_timer.start()
 
     def _detect_video(self) -> bool:
         if self.doc.audio_path:
@@ -132,23 +143,41 @@ class CorrectionEditor(QWidget):
             speed_row.addWidget(btn)
             self._speed_buttons_list.append(btn)
 
-        speed_row.addStretch()
-
         self.lbl_speed = QLabel("1.0x")
         self.lbl_speed.setStyleSheet(f"color: {ACCENT}; font-weight: bold; font-size: 12px;")
         speed_row.addWidget(self.lbl_speed)
 
-        vol_label = QLabel("  Vol:")
+        speed_row.addStretch()
+
+        vol_label = QLabel("Vol:")
         vol_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         speed_row.addWidget(vol_label)
 
         self.slider_vol = QSlider(Qt.Orientation.Horizontal)
-        self.slider_vol.setRange(0, 100)
+        self.slider_vol.setRange(0, 120)
         self.slider_vol.setValue(80)
-        self.slider_vol.setFixedWidth(100)
+        self.slider_vol.setFixedWidth(120)
         speed_row.addWidget(self.slider_vol)
 
+        self.lbl_vol = QLabel("80%")
+        self.lbl_vol.setFixedWidth(44)
+        self.lbl_vol.setStyleSheet(f"color: #00E676; font-family: 'Segoe UI', sans-serif; font-size: 11px; font-weight: bold;")
+        speed_row.addWidget(self.lbl_vol)
+
         root.addLayout(speed_row)
+
+        # -- VU Meter --------------------------------------------------------
+        vu_row = QHBoxLayout()
+        vu_row.setSpacing(6)
+        vu_label = QLabel("Level:")
+        vu_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
+        vu_label.setFixedWidth(40)
+        vu_row.addWidget(vu_label)
+
+        self._vu_meter = VUMeter()
+        vu_row.addWidget(self._vu_meter, 1)
+
+        root.addLayout(vu_row)
 
         # -- Main content: video (optional) + transcript ---------------------
         if self._is_video:
@@ -236,7 +265,7 @@ class CorrectionEditor(QWidget):
         self.player.state_changed.connect(self._on_state)
 
         self.slider_pos.sliderMoved.connect(self._on_seek_slider)
-        self.slider_vol.valueChanged.connect(lambda v: self.player.set_volume(v / 100.0))
+        self.slider_vol.valueChanged.connect(self._on_volume_change)
 
         self.text_edit.textChanged.connect(self._sync_text_to_model)
         self.text_edit.mouseReleaseEvent = self._on_text_click
@@ -276,6 +305,63 @@ class CorrectionEditor(QWidget):
             new_segments.append(Segment(start=start, end=end, text=text, speaker=speaker))
 
         self.doc.segments = new_segments
+
+    # -- Volume --------------------------------------------------------------
+
+    def _on_volume_change(self, value: int) -> None:
+        self._volume_pct = value
+        self.player.set_volume(value / 100.0)
+        self.lbl_vol.setText(f"{value}%")
+        # Colour gradient: green (low) → yellow (mid) → red (high/boost)
+        color = self._volume_color(value)
+        self.lbl_vol.setStyleSheet(
+            f"color: {color}; font-family: 'Segoe UI', sans-serif; font-size: 11px; font-weight: bold;"
+        )
+
+    @staticmethod
+    def _volume_color(value: int) -> str:
+        """Return a hex colour for the volume label: green → yellow → red."""
+        if value <= 50:
+            # Green: #00E676
+            return "#00E676"
+        elif value <= 80:
+            # Green → Yellow: interpolate #00E676 → #FFD600
+            t = (value - 50) / 30.0
+            r = int(0x00 + t * (0xFF - 0x00))
+            g = int(0xE6 + t * (0xD6 - 0xE6))
+            b = int(0x76 + t * (0x00 - 0x76))
+            return f"#{r:02X}{g:02X}{b:02X}"
+        elif value <= 100:
+            # Yellow → Orange-red: interpolate #FFD600 → #FF5722
+            t = (value - 80) / 20.0
+            r = 0xFF
+            g = int(0xD6 + t * (0x57 - 0xD6))
+            b = int(0x00 + t * (0x22 - 0x00))
+            return f"#{r:02X}{g:02X}{b:02X}"
+        else:
+            # 101-120: Red hot: #FF1744
+            return "#FF1744"
+
+    # -- VU Meter ------------------------------------------------------------
+
+    def _precompute_levels(self) -> None:
+        """Load audio levels in a background thread."""
+        import threading
+        path = str(self.doc.audio_path)
+        def _worker():
+            self._level_provider.load(path)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_vu(self) -> None:
+        """Called every 50ms to update the VU meter."""
+        if not self.player.is_playing or not self._level_provider.ready:
+            # Decay to zero when paused
+            self._vu_meter.set_level(max(0, self._vu_meter._level - 0.05))
+            return
+        seconds = self.player.position_ms / 1000.0
+        vol_mult = self._volume_pct / 80.0  # scale relative to 80% baseline
+        level = self._level_provider.level_at(seconds, vol_mult)
+        self._vu_meter.set_level(level)
 
     # -- Click to seek -------------------------------------------------------
 
