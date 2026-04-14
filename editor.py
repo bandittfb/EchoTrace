@@ -1,6 +1,7 @@
 """Express Scribe-style correction editor with optional video panel."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Slot
@@ -24,6 +25,35 @@ from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_SECONDARY, 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
 SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+# Regex to parse "[HH:MM:SS -> HH:MM:SS]  Speaker:  text"
+_TS_RE = re.compile(
+    r"^\[(\d{2}):(\d{2}):(\d{2})\s*->\s*(\d{2}):(\d{2}):(\d{2})\](.*)$"
+)
+
+
+def _parse_ts(h: str, m: str, s: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
+def _parse_line(line: str):
+    """Parse a transcript line. Returns (start, end, speaker, text) or None."""
+    m = _TS_RE.match(line.strip())
+    if not m:
+        return None
+    start = _parse_ts(m.group(1), m.group(2), m.group(3))
+    end = _parse_ts(m.group(4), m.group(5), m.group(6))
+    rest = m.group(7).strip()
+    # Parse optional "Speaker: text"
+    speaker = ""
+    text = rest
+    colon_pos = rest.find(":")
+    if colon_pos != -1:
+        potential_speaker = rest[:colon_pos].strip()
+        if 1 <= len(potential_speaker) <= 40:
+            speaker = potential_speaker
+            text = rest[colon_pos + 1:].strip()
+    return start, end, speaker, text
 
 
 class CorrectionEditor(QWidget):
@@ -63,12 +93,12 @@ class CorrectionEditor(QWidget):
 
         self.btn_play = QPushButton("Play  (F5)")
         self.btn_play.setObjectName("playBtn")
-        self.btn_play.setFixedWidth(120)
+        self.btn_play.setMinimumWidth(130)
 
         self.btn_rw = QPushButton("- 5s  (F6)")
-        self.btn_rw.setFixedWidth(90)
+        self.btn_rw.setMinimumWidth(100)
         self.btn_ff = QPushButton("+ 5s  (F7)")
-        self.btn_ff.setFixedWidth(90)
+        self.btn_ff.setMinimumWidth(100)
 
         self.slider_pos = QSlider(Qt.Orientation.Horizontal)
         self.slider_pos.setRange(0, 1000)
@@ -95,7 +125,7 @@ class CorrectionEditor(QWidget):
         self._speed_buttons_list = []
         for spd in SPEED_PRESETS:
             btn = QPushButton(f"{spd}x")
-            btn.setFixedWidth(48)
+            btn.setMinimumWidth(52)
             btn.setCheckable(True)
             btn.setChecked(spd == 1.0)
             btn.clicked.connect(lambda checked, s=spd: self._set_speed(s))
@@ -232,44 +262,37 @@ class CorrectionEditor(QWidget):
     # -- Sync text back to model ---------------------------------------------
 
     def _sync_text_to_model(self) -> None:
+        """Rebuild the segment list from the editor text, matching by timestamp."""
         if self._block_sync:
             return
-        lines = self.text_edit.toPlainText().split("\n")
-        for i, line in enumerate(lines):
-            if i >= len(self.doc.segments):
-                break
-            bracket_end = line.find("]")
-            if bracket_end != -1:
-                rest = line[bracket_end + 1:].strip()
-                # Parse "SpeakerName: text" — everything before first ":" is speaker
-                colon_pos = rest.find(":")
-                if colon_pos != -1:
-                    potential_speaker = rest[:colon_pos].strip()
-                    # Only treat as speaker if it looks like a name (not too long,
-                    # no line-like content). Speaker names are typically short labels.
-                    if 1 <= len(potential_speaker) <= 40 and "\n" not in potential_speaker:
-                        self.doc.segments[i].speaker = potential_speaker
-                        self.doc.segments[i].text = rest[colon_pos + 1:].strip()
-                    else:
-                        self.doc.segments[i].text = rest
-                else:
-                    # No colon — no speaker label, just text
-                    self.doc.segments[i].speaker = ""
-                    self.doc.segments[i].text = rest
+        from models import Segment
+
+        new_segments: list[Segment] = []
+        for line in self.text_edit.toPlainText().split("\n"):
+            parsed = _parse_line(line)
+            if parsed is None:
+                continue  # skip blank lines or lines without valid timestamps
+            start, end, speaker, text = parsed
+            new_segments.append(Segment(start=start, end=end, text=text, speaker=speaker))
+
+        self.doc.segments = new_segments
 
     # -- Click to seek -------------------------------------------------------
 
     def _on_text_click(self, event) -> None:
         QPlainTextEdit.mouseReleaseEvent(self.text_edit, event)
         cursor = self.text_edit.cursorForPosition(event.pos())
-        block_num = cursor.blockNumber()
         col = cursor.positionInBlock()
 
-        if block_num < len(self.doc.segments) and col < 25:
-            seg = self.doc.segments[block_num]
-            self.player.seek(int(seg.start * 1000))
-            if not self.player.is_playing:
-                self.player.play()
+        # Only seek if clicking in the timestamp portion (first ~25 chars)
+        if col < 25:
+            block = cursor.block()
+            parsed = _parse_line(block.text())
+            if parsed:
+                start, end, speaker, text = parsed
+                self.player.seek(int(start * 1000))
+                if not self.player.is_playing:
+                    self.player.play()
 
     # -- Playback callbacks --------------------------------------------------
 
@@ -281,10 +304,11 @@ class CorrectionEditor(QWidget):
         if not self.slider_pos.isSliderDown() and total > 0:
             self.slider_pos.setValue(int(ms / total * 1000))
 
-        idx = self.doc.segment_at_time(ms / 1000.0)
-        if idx != self._current_seg_idx:
-            self._highlight_segment(idx)
-            self._current_seg_idx = idx
+        # Find which editor line matches the current playback time
+        line_idx = self._line_at_time(ms / 1000.0)
+        if line_idx != self._current_seg_idx:
+            self._highlight_segment(line_idx)
+            self._current_seg_idx = line_idx
 
     @Slot(int)
     def _on_duration(self, ms: int) -> None:
@@ -309,6 +333,24 @@ class CorrectionEditor(QWidget):
         self.lbl_speed.setText(f"{rate}x")
         for btn in self._speed_buttons_list:
             btn.setChecked(btn.text() == f"{rate}x")
+
+    # -- Find line by time ---------------------------------------------------
+
+    def _line_at_time(self, seconds: float) -> int:
+        """Find the editor line number whose timestamp range contains *seconds*."""
+        best_idx = -1
+        doc = self.text_edit.document()
+        for i in range(doc.blockCount()):
+            block = doc.findBlockByNumber(i)
+            parsed = _parse_line(block.text())
+            if parsed:
+                start, end, _, _ = parsed
+                if start <= seconds <= end:
+                    return i
+                # Also track the closest preceding segment
+                if start <= seconds:
+                    best_idx = i
+        return best_idx
 
     # -- Highlight current segment -------------------------------------------
 
