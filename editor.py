@@ -322,6 +322,8 @@ class CorrectionEditor(QWidget):
         # Small square buttons need reduced padding; global theme's
         # 6px 14px would clip the single-letter label.
         compact_css = "QPushButton { padding: 2px; min-width: 0; font-size: 13px; }"
+        # Medium buttons: same visual language as compact, just wider for labels.
+        medium_css = "QPushButton { padding: 2px 10px; font-size: 12px; }"
 
         bold_font = QFont("Segoe UI", 11)
         bold_font.setBold(True)
@@ -361,14 +363,14 @@ class CorrectionEditor(QWidget):
 
         self.btn_undo = QPushButton("↩ Undo")
         self.btn_undo.setToolTip("Undo (Ctrl+Z)")
-        self.btn_undo.setMinimumWidth(70)
-        self.btn_undo.setFixedHeight(26)
+        self.btn_undo.setFixedSize(72, 26)
+        self.btn_undo.setStyleSheet(medium_css)
         row.addWidget(self.btn_undo)
 
         self.btn_redo = QPushButton("↪ Redo")
         self.btn_redo.setToolTip("Redo (Ctrl+Y)")
-        self.btn_redo.setMinimumWidth(70)
-        self.btn_redo.setFixedHeight(26)
+        self.btn_redo.setFixedSize(72, 26)
+        self.btn_redo.setStyleSheet(medium_css)
         row.addWidget(self.btn_redo)
 
         sep2 = QFrame()
@@ -379,8 +381,8 @@ class CorrectionEditor(QWidget):
 
         self.btn_clear_fmt = QPushButton("✕ Clear")
         self.btn_clear_fmt.setToolTip("Remove formatting from selection")
-        self.btn_clear_fmt.setMinimumWidth(70)
-        self.btn_clear_fmt.setFixedHeight(26)
+        self.btn_clear_fmt.setFixedSize(72, 26)
+        self.btn_clear_fmt.setStyleSheet(medium_css)
         row.addWidget(self.btn_clear_fmt)
 
         return row
