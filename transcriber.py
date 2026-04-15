@@ -140,6 +140,9 @@ class TranscriberWorker(QThread):
         self.model_size = model_size
         self.language = language
         self.enable_diarization = enable_diarization
+        # Populated by _transcribe(); main thread reads these in _on_finished()
+        self.detected_language: str = ""
+        self.detected_language_probability: float = 0.0
 
     def run(self) -> None:
         try:
@@ -164,6 +167,13 @@ class TranscriberWorker(QThread):
 
         segments_gen, info = model.transcribe(self.audio_path, **kwargs)
         duration = info.duration or 1.0
+
+        # Capture language detection results so the main thread can store
+        # them on the TranscriptDocument (used by exporters and the editor).
+        self.detected_language = getattr(info, "language", "") or ""
+        self.detected_language_probability = float(
+            getattr(info, "language_probability", 0.0) or 0.0
+        )
 
         result: list[Segment] = []
         for seg in segments_gen:

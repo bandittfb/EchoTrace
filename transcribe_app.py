@@ -8,12 +8,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot, QSize
-from PySide6.QtGui import QBrush, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QGraphicsDropShadowEffect
+from PySide6.QtCore import Qt, QTimer, Slot, QSize
+from PySide6.QtGui import QAction, QBrush, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import QGraphicsDropShadowEffect, QInputDialog, QMenu
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -22,10 +24,13 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStackedWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from autosave import AUTOSAVE_INTERVAL_MS, autosave_path, clear_autosave, find_recoverable, write_autosave
+from fade_stack import FadeStackedWidget
 from editor import CorrectionEditor
 from exporters import export_docx, export_json, export_pdf, export_txt
 from models import Segment, TranscriptDocument
@@ -33,7 +38,12 @@ from theme import APP_NAME, APP_SUBTITLE, STYLESHEET
 from transcriber import TranscriberWorker
 from waiting_widget import WaitingWidget
 
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".mp4", ".mkv", ".webm"}
+AUDIO_EXTS = {
+    # Audio
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac",
+    # Video (must stay in sync with VIDEO_EXTS in editor.py and README.md)
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v",
+}
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
 LOGO_PATH = Path(__file__).parent / "logo.png"
 
@@ -91,7 +101,13 @@ class DropZone(QLabel):
         if files and self._callback:
             self._callback(files[0])
         elif not files:
-            QMessageBox.warning(self, "Unsupported file", "Drop an audio or video file (.mp3, .wav, .m4a, .mp4, etc.)")
+            QMessageBox.warning(
+                self,
+                "Unsupported file",
+                "Drop an audio or video file.\n\n"
+                "Audio: MP3, WAV, M4A, FLAC, OGG, WMA, AAC\n"
+                "Video: MP4, MKV, WebM, AVI, MOV, WMV, FLV, M4V",
+            )
 
 
 class MainWindow(QMainWindow):
@@ -110,13 +126,24 @@ class MainWindow(QMainWindow):
         self._editor = None
         self._project_path = None
 
-        self._stack = QStackedWidget()
+        # Cross-fading stack — gives the app a more cinematic transition
+        # between Phase 1 (start), waiting screen, and Phase 2 (editor).
+        self._stack = FadeStackedWidget()
         self.setCentralWidget(self._stack)
         self._segment_count = 0
 
         self._build_phase1()
         self._build_waiting_screen()
         self._build_phase2_placeholder()
+
+        # Autosave: timer ticks every AUTOSAVE_INTERVAL_MS while a doc is open
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(self._tick_autosave)
+
+        # Show recovery prompt after the window paints (deferred so the
+        # main UI is visible behind the dialog).
+        QTimer.singleShot(150, self._maybe_offer_recovery)
 
     # -- Phase 1 UI ----------------------------------------------------------
 
@@ -258,6 +285,7 @@ class MainWindow(QMainWindow):
                         # Open transcript-only (no playback)
                         self._doc.audio_path = None
 
+                self._doc.log("Project opened", path)
                 self._open_editor()
             except Exception as e:
                 QMessageBox.critical(self, "Load Error", str(e))
@@ -279,11 +307,146 @@ class MainWindow(QMainWindow):
         )
         if path:
             try:
+                self._doc.log("Project saved", path)
                 self._doc.save_json(Path(path))
                 self._project_path = Path(path)
+                # Successful explicit save invalidates the autosave file —
+                # it's now stale and would only confuse the recovery prompt.
+                clear_autosave()
                 QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Save Error", str(e))
+
+    # -- Autosave + crash recovery ------------------------------------------
+
+    def _tick_autosave(self) -> None:
+        """Called by the autosave timer. Writes a snapshot of the current
+        document. Failures are silent — autosave must never disrupt work."""
+        if not self._doc or not self._doc.segments:
+            return
+        try:
+            # Pull the latest editor text into the model first
+            if self._editor:
+                self._editor._sync_text_to_model()
+            import json
+            write_autosave(json.dumps(self._doc.to_dict(), indent=2, ensure_ascii=False))
+        except Exception:
+            # Swallow — better to lose this tick than crash the editor
+            pass
+
+    def _maybe_offer_recovery(self) -> None:
+        """If an autosave file is sitting around from a prior crash, ask
+        the user if they want to restore it."""
+        found = find_recoverable()
+        if not found:
+            return
+        path, mtime = found
+        try:
+            doc = TranscriptDocument.load_json(path)
+        except Exception:
+            # Corrupt autosave — nuke it so we don't ask again
+            clear_autosave()
+            return
+        if not doc.segments:
+            clear_autosave()
+            return
+
+        when = mtime.strftime("%b %d, %Y at %I:%M %p")
+        media = doc.audio_path.name if doc.audio_path else "(no media)"
+        seg_count = len(doc.segments)
+        reply = QMessageBox.question(
+            self,
+            "Recover unsaved work?",
+            f"EchoTrace found an unsaved session from {when}.\n\n"
+            f"  Media: {media}\n"
+            f"  Segments: {seg_count}\n\n"
+            f"Would you like to recover it? Choose 'No' to discard.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._doc = doc
+            self._project_path = None  # force Save As — recovered, not saved
+            self._doc.log("Recovered from autosave", str(path))
+            # Verify media still exists; if not, behave like missing-media reopen
+            if self._doc.audio_path and not self._doc.audio_path.exists():
+                ext_str = " ".join(f"*{e}" for e in AUDIO_EXTS)
+                relocate = QMessageBox.question(
+                    self, "Media file not found",
+                    f"The media file is missing:\n{self._doc.audio_path}\n\n"
+                    f"Would you like to locate it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if relocate == QMessageBox.StandardButton.Yes:
+                    new_path, _ = QFileDialog.getOpenFileName(
+                        self, "Locate media file", "",
+                        f"Audio/Video ({ext_str});;All (*.*)")
+                    self._doc.audio_path = Path(new_path) if new_path else None
+                else:
+                    self._doc.audio_path = None
+            self._open_editor()
+        else:
+            clear_autosave()
+
+    # -- Audit log -----------------------------------------------------------
+
+    def _show_audit_log(self) -> None:
+        """Display the document's audit trail in a read-only dialog."""
+        if not self._doc:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Audit Log")
+        dlg.resize(640, 420)
+        layout = QVBoxLayout(dlg)
+
+        intro = QLabel(
+            f"Activity history for this transcript "
+            f"({len(self._doc.audit_log)} entries)."
+        )
+        intro.setStyleSheet("color: #8892A0; font-size: 11px;")
+        layout.addWidget(intro)
+
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setStyleSheet(
+            "font-family: Consolas, 'Courier New', monospace; font-size: 11px;"
+        )
+        if self._doc.audit_log:
+            lines = [
+                f"[{e.ts}]  {e.action}" + (f"  —  {e.details}" if e.details else "")
+                for e in self._doc.audit_log
+            ]
+            view.setPlainText("\n".join(lines))
+        else:
+            view.setPlainText("(no entries yet)")
+        layout.addWidget(view, 1)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("Add Note...")
+        btn_add.clicked.connect(lambda: self._add_audit_note(view))
+        btn_row.addWidget(btn_add)
+        btn_row.addStretch()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        bb.button(QDialogButtonBox.StandardButton.Close).clicked.connect(dlg.accept)
+        btn_row.addWidget(bb)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _add_audit_note(self, view: "QTextEdit") -> None:
+        """Prompt the user for a free-form audit note and append it."""
+        if not self._doc:
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Add Audit Note",
+            "Note (e.g. 'Reviewed with attorney Jones; confirmed admission at 14:22'):",
+        )
+        if not ok or not text.strip():
+            return
+        entry = self._doc.log("Manual note", text.strip())
+        # Refresh the view in-place
+        view.append(f"[{entry.ts}]  {entry.action}  —  {entry.details}")
 
     def _start_transcription(self, path: str) -> None:
         self._segment_count = 0
@@ -312,11 +475,22 @@ class MainWindow(QMainWindow):
     @Slot(list)
     def _on_finished(self, segments: list[Segment]) -> None:
         self._waiting.stop()
+        # Pull language metadata off the worker (populated during transcription)
+        lang = getattr(self._worker, "detected_language", "") if self._worker else ""
+        lang_prob = getattr(self._worker, "detected_language_probability", 0.0) if self._worker else 0.0
         self._doc = TranscriptDocument(
             segments=segments,
             audio_path=Path(self._audio_path),
             model_size=self.combo_model.currentText(),
+            language=lang,
+            language_probability=lang_prob,
             created_at=datetime.now().isoformat(),
+        )
+        diar = " + diarization" if self.btn_diarize.isChecked() else ""
+        self._doc.log(
+            "Transcription completed",
+            f"model={self.combo_model.currentText()}{diar}, "
+            f"segments={len(segments)}, language={lang or 'unknown'}",
         )
         self._open_editor()
 
@@ -348,32 +522,56 @@ class MainWindow(QMainWindow):
         lbl_brand.setStyleSheet("font-size: 15px; font-weight: bold; margin-right: 12px;")
         top_bar.addWidget(lbl_brand)
 
-        lbl_file = QLabel(f"{self._doc.audio_path.name}")
+        file_name = self._doc.audio_path.name if self._doc.audio_path else "(transcript only — no media)"
+        lbl_file = QLabel(file_name)
         lbl_file.setObjectName("fileLabel")
         lbl_file.setStyleSheet("color: #8892A0; font-weight: normal;")
+        lbl_file.setToolTip(
+            str(self._doc.audio_path) if self._doc.audio_path
+            else "Original media file is not available. Playback is disabled."
+        )
         top_bar.addWidget(lbl_file)
 
         top_bar.addStretch()
 
         btn_save = QPushButton("Save Project")
-        btn_save.setObjectName("exportBtn")
+        btn_save.setObjectName("primaryBtn")
+        btn_save.setShortcut("Ctrl+S")
+        btn_save.setToolTip("Save this project as an .echotrace file (Ctrl+S)")
         btn_save.clicked.connect(self._save_project)
         top_bar.addWidget(btn_save)
 
+        # Single Export ▾ button — opens a menu with all four formats.
+        # Replaces four side-by-side buttons that crowded the top bar.
+        btn_export = QPushButton("Export  ▾")
+        btn_export.setObjectName("exportBtn")
+        btn_export.setToolTip("Export the corrected transcript to TXT, DOCX, JSON, or PDF")
+        export_menu = QMenu(btn_export)
+        for label, fn in [
+            ("Plain Text  (.txt)", self._export_txt),
+            ("Word Document  (.docx)", self._export_docx),
+            ("JSON  (.json)", self._export_json),
+            ("PDF  (.pdf)", self._export_pdf),
+        ]:
+            act = QAction(label, export_menu)
+            act.triggered.connect(fn)
+            export_menu.addAction(act)
+        btn_export.setMenu(export_menu)
+        top_bar.addWidget(btn_export)
+
+        btn_audit = QPushButton("Audit Log...")
+        btn_audit.setObjectName("exportBtn")
+        btn_audit.setToolTip(
+            "View the activity history for this transcript "
+            "(opens, saves, exports, manual notes)"
+        )
+        btn_audit.clicked.connect(self._show_audit_log)
+        top_bar.addWidget(btn_audit)
+
         btn_new = QPushButton("New File")
+        btn_new.setToolTip("Close this transcript and return to the start screen")
         btn_new.clicked.connect(self._back_to_phase1)
         top_bar.addWidget(btn_new)
-
-        for label, fn in [
-            ("Export TXT", self._export_txt),
-            ("Export DOCX", self._export_docx),
-            ("Export JSON", self._export_json),
-            ("Export PDF", self._export_pdf),
-        ]:
-            btn = QPushButton(label)
-            btn.setObjectName("exportBtn")
-            btn.clicked.connect(fn)
-            top_bar.addWidget(btn)
 
         layout.addLayout(top_bar)
 
@@ -394,6 +592,9 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(page)
         self._stack.setCurrentWidget(page)
 
+        # Start autosave now that there's an open document
+        self._autosave_timer.start()
+
     def _back_to_phase1(self) -> None:
         reply = QMessageBox.question(
             self, "Save project?",
@@ -409,22 +610,26 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Ready — drop a file or click Browse to begin.")
         if self._editor:
             self._editor.player.pause()
+        # Stop autosaving and clean up the autosave file — we're back to
+        # the start screen, there's nothing to recover.
+        self._autosave_timer.stop()
+        clear_autosave()
 
     # -- Export actions -------------------------------------------------------
 
     def _export_txt(self) -> None:
-        self._do_export("Text files (*.txt)", ".txt", export_txt)
+        self._do_export("Text files (*.txt)", ".txt", export_txt, capture_formatting=False)
 
     def _export_docx(self) -> None:
-        self._do_export("Word documents (*.docx)", ".docx", export_docx)
+        self._do_export("Word documents (*.docx)", ".docx", export_docx, capture_formatting=True)
 
     def _export_json(self) -> None:
-        self._do_export("JSON files (*.json)", ".json", export_json)
+        self._do_export("JSON files (*.json)", ".json", export_json, capture_formatting=False)
 
     def _export_pdf(self) -> None:
-        self._do_export("PDF files (*.pdf)", ".pdf", export_pdf)
+        self._do_export("PDF files (*.pdf)", ".pdf", export_pdf, capture_formatting=True)
 
-    def _do_export(self, filter_str: str, suffix: str, exporter) -> None:
+    def _do_export(self, filter_str: str, suffix: str, exporter, capture_formatting: bool = False) -> None:
         if not self._doc:
             return
         if self._editor:
@@ -434,10 +639,29 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export transcript", default_name, filter_str)
         if path:
             try:
-                exporter(self._doc, Path(path))
+                # Only DOCX/PDF carry rich formatting; TXT/JSON ignore it.
+                if capture_formatting and self._editor:
+                    rich_runs = self._editor.extract_rich_runs()
+                    exporter(self._doc, Path(path), rich_runs=rich_runs)
+                else:
+                    exporter(self._doc, Path(path))
+                self._doc.log(f"Exported {suffix.lstrip('.').upper()}", path)
                 QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", str(e))
+
+    # -- App-wide close -------------------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        """On clean app exit, flush a final autosave so the user can recover
+        anything they hadn't explicitly saved. (We deliberately do NOT
+        clear here — a clean save already cleared it; if there are unsaved
+        changes, we want them recoverable on next launch.)"""
+        try:
+            self._tick_autosave()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # -- Drag and drop on main window ----------------------------------------
 

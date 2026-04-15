@@ -6,7 +6,7 @@ if not exist .venv\Scripts\python.exe (
     if errorlevel 1 goto error
 )
 call .venv\Scripts\activate.bat
-.venv\Scripts\python.exe -c "import PySide6, faster_whisper, docx, fpdf" 2>nul
+.venv\Scripts\python.exe -c "import PySide6, faster_whisper, docx, fpdf, hid, pyannote.audio, scipy" 2>nul
 if errorlevel 1 (
     echo Installing dependencies...
     pip install -r requirements.txt

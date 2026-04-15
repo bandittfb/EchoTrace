@@ -1,17 +1,18 @@
 """Express Scribe-style correction editor with optional video panel."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
+from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, Qt, QTimer, Slot
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSlider,
     QSplitter,
@@ -22,43 +23,47 @@ from PySide6.QtWidgets import (
 
 from audio_player import AudioPlayer
 from flow_layout import FlowLayout
-from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
+from models import FormattedRun, TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
 from pedal import FootPedalListener, PedalButton
 from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
+from speaker_dialog import SpeakerManagerDialog
 from toggle_switch import ToggleSwitch
+from transcript_format import format_line, parse_line
 from vu_meter import AudioLevelProvider, VUMeter
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
 SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
-# Regex to parse "[HH:MM:SS -> HH:MM:SS]  Speaker:  text"
-_TS_RE = re.compile(
-    r"^\[(\d{2}):(\d{2}):(\d{2})\s*->\s*(\d{2}):(\d{2}):(\d{2})\](.*)$"
-)
+# Flag presentation. Keys must match models.FLAG_KINDS.
+# (label, background tint, accent dot color)
+FLAG_DISPLAY = {
+    "inaudible":     ("Inaudible",        "#3F3A1A", "#FFD600"),
+    "admission":     ("Possible Admission", "#3F1A1A", "#FF1744"),
+    "contradiction": ("Contradiction",    "#3F2A1A", "#FF6F00"),
+    "follow_up":     ("Follow-up",        "#1A2F3F", "#40C4FF"),
+    "custom":        ("Custom",           "#2A1A3F", "#B388FF"),
+}
 
 
-def _parse_ts(h: str, m: str, s: str) -> float:
-    return int(h) * 3600 + int(m) * 60 + int(s)
-
-
-def _parse_line(line: str):
-    """Parse a transcript line. Returns (start, end, speaker, text) or None."""
-    m = _TS_RE.match(line.strip())
-    if not m:
-        return None
-    start = _parse_ts(m.group(1), m.group(2), m.group(3))
-    end = _parse_ts(m.group(4), m.group(5), m.group(6))
-    rest = m.group(7).strip()
-    # Parse optional "Speaker: text"
-    speaker = ""
-    text = rest
-    colon_pos = rest.find(":")
-    if colon_pos != -1:
-        potential_speaker = rest[:colon_pos].strip()
-        if 1 <= len(potential_speaker) <= 40:
-            speaker = potential_speaker
-            text = rest[colon_pos + 1:].strip()
-    return start, end, speaker, text
+def _coalesce_runs(runs: list[FormattedRun]) -> list[FormattedRun]:
+    """Merge consecutive runs whose B/I/U flags match — Qt sometimes splits
+    a fragment for cursor-position reasons even when nothing changed."""
+    out: list[FormattedRun] = []
+    for r in runs:
+        if out and (
+            out[-1].bold == r.bold
+            and out[-1].italic == r.italic
+            and out[-1].underline == r.underline
+        ):
+            out[-1] = FormattedRun(
+                text=out[-1].text + r.text,
+                bold=r.bold,
+                italic=r.italic,
+                underline=r.underline,
+            )
+        else:
+            out.append(r)
+    return out
 
 
 class CorrectionEditor(QWidget):
@@ -78,6 +83,9 @@ class CorrectionEditor(QWidget):
         self._search_idx = -1
         self._search_query = ""
         self._segment_selection: QTextEdit.ExtraSelection | None = None
+        # Animated highlight: flashes brighter when segment changes, then
+        # decays to the steady SEGMENT_HIGHLIGHT color over ~280ms.
+        self._highlight_intensity = 0.0  # 1.0 = peak flash, 0.0 = steady
 
         self._build_ui()
         self._connect_signals()
@@ -451,6 +459,35 @@ class CorrectionEditor(QWidget):
         self.btn_clear_fmt.setStyleSheet(medium_css)
         row.addWidget(self.btn_clear_fmt)
 
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.VLine)
+        sep3.setFixedHeight(20)
+        sep3.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        row.addWidget(sep3)
+
+        # Flags dropdown — count updates as user flags segments
+        self.btn_flags = QPushButton("Flags  ▾")
+        self.btn_flags.setToolTip(
+            "Jump to a flagged segment.\n"
+            "Right-click any line in the transcript to add a flag."
+        )
+        self.btn_flags.setFixedHeight(26)
+        self.btn_flags.setMinimumWidth(86)
+        self.btn_flags.setStyleSheet(medium_css)
+        self.btn_flags.clicked.connect(self._open_flags_menu)
+        row.addWidget(self.btn_flags)
+
+        # Speakers... — opens the speaker management dialog
+        self.btn_speakers = QPushButton("Speakers...")
+        self.btn_speakers.setToolTip(
+            "Rename or merge speakers across the entire transcript"
+        )
+        self.btn_speakers.setFixedHeight(26)
+        self.btn_speakers.setMinimumWidth(90)
+        self.btn_speakers.setStyleSheet(medium_css)
+        self.btn_speakers.clicked.connect(self._open_speaker_manager)
+        row.addWidget(self.btn_speakers)
+
         return container
 
     def _connect_signals(self) -> None:
@@ -468,6 +505,8 @@ class CorrectionEditor(QWidget):
         self.text_edit.textChanged.connect(self._sync_text_to_model)
         self.text_edit.mouseReleaseEvent = self._on_text_click
         self.text_edit.cursorPositionChanged.connect(self._update_format_buttons)
+        self.text_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.text_edit.customContextMenuRequested.connect(self._on_text_context_menu)
 
         # Formatting toolbar
         self.btn_bold.clicked.connect(self._toggle_bold)
@@ -499,31 +538,113 @@ class CorrectionEditor(QWidget):
     def _render_transcript(self) -> None:
         self._block_sync = True
         self.text_edit.clear()
-        lines = []
-        for seg in self.doc.segments:
-            ts = f"[{fmt_timestamp(seg.start)} -> {fmt_timestamp(seg.end)}]"
-            speaker = f"  {seg.speaker}:" if seg.speaker else ""
-            lines.append(f"{ts}{speaker}  {seg.text}")
+        lines = [
+            format_line(seg.start, seg.end, seg.text, seg.speaker)
+            for seg in self.doc.segments
+        ]
         self.text_edit.setPlainText("\n".join(lines))
         self._block_sync = False
+        # Re-paint flag tints + update Flags button count for the loaded doc
+        self._refresh_extra_selections()
+        self._refresh_flag_button()
 
     # -- Sync text back to model ---------------------------------------------
 
     def _sync_text_to_model(self) -> None:
-        """Rebuild the segment list from the editor text, matching by timestamp."""
+        """Rebuild the segment list from the editor text, matching by timestamp.
+
+        Flags and notes aren't represented in the editor text, so we
+        preserve them across the rebuild by keying on the (start, end)
+        timestamp pair — those columns are stable as long as the user
+        doesn't edit the timestamp text itself.
+        """
         if self._block_sync:
             return
         from models import Segment
 
+        # Snapshot existing flag/note metadata before we rebuild
+        old_meta = {
+            (s.start, s.end): (s.flag, s.note) for s in self.doc.segments
+        }
+
         new_segments: list[Segment] = []
         for line in self.text_edit.toPlainText().split("\n"):
-            parsed = _parse_line(line)
+            parsed = parse_line(line)
             if parsed is None:
                 continue  # skip blank lines or lines without valid timestamps
             start, end, speaker, text = parsed
-            new_segments.append(Segment(start=start, end=end, text=text, speaker=speaker))
+            flag, note = old_meta.get((start, end), ("", ""))
+            new_segments.append(Segment(
+                start=start, end=end, text=text, speaker=speaker,
+                flag=flag, note=note,
+            ))
 
         self.doc.segments = new_segments
+
+    def extract_rich_runs(self) -> list[list[FormattedRun]]:
+        """Return per-segment B/I/U formatting captured from the editor.
+
+        The result is parallel to ``self.doc.segments`` (one entry per
+        segment, in document order). Each entry is a list of
+        ``FormattedRun`` objects covering only the *text* portion of the
+        line (timestamps and speaker prefixes are skipped). Empty list if
+        the segment's plaintext was empty.
+
+        DOCX/PDF exporters use this to re-apply Bold/Italic/Underline that
+        the user toggled in the editor. TXT/JSON exports ignore it.
+        """
+        runs_per_segment: list[list[FormattedRun]] = []
+        doc = self.text_edit.document()
+        for i in range(doc.blockCount()):
+            block = doc.findBlockByNumber(i)
+            plain = block.text()
+            parsed = parse_line(plain)
+            if parsed is None:
+                continue
+            _, _, _speaker, text = parsed
+            if not text:
+                runs_per_segment.append([])
+                continue
+
+            # Find where the text portion begins inside the block's plain
+            # text. The render uses "  text" suffix, so rfind is reliable
+            # even if the timestamp/speaker contains the same string.
+            text_start = plain.rfind(text)
+            if text_start < 0:
+                runs_per_segment.append([FormattedRun(text=text)])
+                continue
+            text_end = text_start + len(text)
+
+            block_runs: list[FormattedRun] = []
+            it = block.begin()
+            block_pos = block.position()
+            while not it.atEnd():
+                fragment = it.fragment()
+                if fragment.isValid():
+                    frag_offset = fragment.position() - block_pos
+                    frag_text = fragment.text()
+                    frag_end = frag_offset + len(frag_text)
+                    overlap_start = max(frag_offset, text_start)
+                    overlap_end = min(frag_end, text_end)
+                    if overlap_start < overlap_end:
+                        sliced = frag_text[
+                            overlap_start - frag_offset : overlap_end - frag_offset
+                        ]
+                        fmt = fragment.charFormat()
+                        block_runs.append(
+                            FormattedRun(
+                                text=sliced,
+                                bold=fmt.fontWeight() >= QFont.Weight.Bold,
+                                italic=fmt.fontItalic(),
+                                underline=fmt.fontUnderline(),
+                            )
+                        )
+                it += 1
+            # Coalesce adjacent runs with identical formatting (keeps DOCX
+            # tidy when the user toggled formatting then turned it back off
+            # mid-typing).
+            runs_per_segment.append(_coalesce_runs(block_runs) if block_runs else [FormattedRun(text=text)])
+        return runs_per_segment
 
         # If a search is active, refresh the highlights since text changed
         if self._search_query:
@@ -804,7 +925,7 @@ class CorrectionEditor(QWidget):
         # Only seek if clicking in the timestamp portion (first ~25 chars)
         if col < 25:
             block = cursor.block()
-            parsed = _parse_line(block.text())
+            parsed = parse_line(block.text())
             if parsed:
                 start, end, speaker, text = parsed
                 self.player.seek(int(start * 1000))
@@ -859,7 +980,7 @@ class CorrectionEditor(QWidget):
         doc = self.text_edit.document()
         for i in range(doc.blockCount()):
             block = doc.findBlockByNumber(i)
-            parsed = _parse_line(block.text())
+            parsed = parse_line(block.text())
             if parsed:
                 start, end, _, _ = parsed
                 if start <= seconds <= end:
@@ -884,7 +1005,7 @@ class CorrectionEditor(QWidget):
             sel = QTextEdit.ExtraSelection()
             sel.cursor = QTextCursor(block)
             sel.format = QTextCharFormat()
-            sel.format.setBackground(QColor(SEGMENT_HIGHLIGHT))
+            sel.format.setBackground(self._current_highlight_color())
             # Spans the full line width regardless of cursor position
             sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
             self._segment_selection = sel
@@ -893,10 +1014,50 @@ class CorrectionEditor(QWidget):
             # mid-keystroke.
             if not self.text_edit.hasFocus():
                 self._scroll_to_block(idx)
+            # Kick off the flash animation
+            self._start_highlight_flash()
         else:
             self._segment_selection = None
 
         self._refresh_extra_selections()
+
+    # -- Animated segment highlight -----------------------------------------
+
+    def _current_highlight_color(self) -> QColor:
+        """Interpolate between the bright flash color and the steady
+        ``SEGMENT_HIGHLIGHT`` based on the current intensity (0..1)."""
+        steady = QColor(SEGMENT_HIGHLIGHT)
+        # Flash color: brighter, slightly more saturated version of accent
+        flash = QColor("#5A2A6E")
+        t = max(0.0, min(1.0, self._highlight_intensity))
+        return QColor(
+            int(steady.red() + t * (flash.red() - steady.red())),
+            int(steady.green() + t * (flash.green() - steady.green())),
+            int(steady.blue() + t * (flash.blue() - steady.blue())),
+        )
+
+    def _get_highlight_intensity(self) -> float:
+        return self._highlight_intensity
+
+    def _set_highlight_intensity(self, value: float) -> None:
+        self._highlight_intensity = value
+        # Re-color the existing selection without rebuilding it
+        if self._segment_selection is not None:
+            self._segment_selection.format.setBackground(self._current_highlight_color())
+            self._refresh_extra_selections()
+
+    highlight_intensity = Property(float, _get_highlight_intensity, _set_highlight_intensity)
+
+    def _start_highlight_flash(self) -> None:
+        """Animate the highlight from peak (1.0) down to steady (0.0)."""
+        if not hasattr(self, "_highlight_anim"):
+            self._highlight_anim = QPropertyAnimation(self, b"highlight_intensity", self)
+            self._highlight_anim.setDuration(280)
+            self._highlight_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+        self._highlight_anim.stop()
+        self._highlight_anim.setStartValue(1.0)
+        self._highlight_anim.setEndValue(0.0)
+        self._highlight_anim.start()
 
     def _scroll_to_block(self, block_number: int) -> None:
         """Scroll the viewport so the given block is visible, without
@@ -915,12 +1076,20 @@ class CorrectionEditor(QWidget):
             scroll.setValue(int(block_top - viewport_h / 2 + rect.height() / 2))
 
     def _refresh_extra_selections(self) -> None:
-        """Combine the segment highlight and all search match highlights
-        into a single setExtraSelections call. Order matters: segment
-        highlight goes first (drawn underneath), search matches on top."""
+        """Compose all editor highlights into one ``setExtraSelections`` call.
+
+        Z-order (lowest first):
+          1. Per-segment flag tints (full-width row backgrounds)
+          2. Currently-playing segment highlight
+          3. Search match highlights
+        """
         selections: list[QTextEdit.ExtraSelection] = []
+        # 1. Flag highlights — one per flagged segment
+        selections.extend(self._build_flag_selections())
+        # 2. Currently-playing segment
         if self._segment_selection is not None:
             selections.append(self._segment_selection)
+        # 3. Search matches
         if self._search_query and self._search_matches:
             all_match_fmt = QTextCharFormat()
             all_match_fmt.setBackground(QColor("#FFEB3B"))
@@ -936,3 +1105,174 @@ class CorrectionEditor(QWidget):
                 sel.format = current_match_fmt if i == self._search_idx else all_match_fmt
                 selections.append(sel)
         self.text_edit.setExtraSelections(selections)
+
+    # -- Flags / bookmarks ---------------------------------------------------
+
+    def _build_flag_selections(self) -> list:
+        """Return one ExtraSelection per flagged segment, full-width tinted."""
+        sels = []
+        doc = self.text_edit.document()
+        # Map segment timestamp -> block index by walking the rendered text
+        seg_to_block: dict[tuple[float, float], int] = {}
+        for i in range(doc.blockCount()):
+            parsed = parse_line(doc.findBlockByNumber(i).text())
+            if parsed:
+                start, end, _, _ = parsed
+                seg_to_block[(start, end)] = i
+        for seg in self.doc.segments:
+            if not seg.flag:
+                continue
+            block_idx = seg_to_block.get((seg.start, seg.end))
+            if block_idx is None:
+                continue
+            display = FLAG_DISPLAY.get(seg.flag)
+            if not display:
+                continue
+            _label, bg_hex, _accent = display
+            block = doc.findBlockByNumber(block_idx)
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = QTextCursor(block)
+            sel.format = QTextCharFormat()
+            sel.format.setBackground(QColor(bg_hex))
+            sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            sels.append(sel)
+        return sels
+
+    def _segment_at_cursor(self, cursor: QTextCursor):
+        """Return the Segment object at the given cursor's block, or None."""
+        parsed = parse_line(cursor.block().text())
+        if not parsed:
+            return None
+        start, end, _, _ = parsed
+        for seg in self.doc.segments:
+            if seg.start == start and seg.end == end:
+                return seg
+        return None
+
+    def _on_text_context_menu(self, pos) -> None:
+        """Right-click menu for flagging the segment under the cursor."""
+        cursor = self.text_edit.cursorForPosition(pos)
+        seg = self._segment_at_cursor(cursor)
+
+        # Start with Qt's default menu (Cut/Copy/Paste/Undo etc.) so we
+        # don't take features away from the user.
+        menu = self.text_edit.createStandardContextMenu()
+
+        if seg is not None:
+            menu.addSeparator()
+            flag_menu = menu.addMenu("Flag segment as...")
+            for kind in ("inaudible", "admission", "contradiction", "follow_up", "custom"):
+                label, _bg, accent = FLAG_DISPLAY[kind]
+                act = QAction(f"  ●  {label}", flag_menu)
+                # Color the menu item dot — not strictly necessary but
+                # gives a quick legend without an extra panel.
+                act.setData(kind)
+                act.triggered.connect(lambda _checked=False, s=seg, k=kind: self._set_flag(s, k))
+                flag_menu.addAction(act)
+
+            note_act = QAction(
+                "Add/edit note..." if not seg.note else f"Edit note ({len(seg.note)} chars)...",
+                menu,
+            )
+            note_act.triggered.connect(lambda _=False, s=seg: self._edit_note(s))
+            menu.addAction(note_act)
+
+            if seg.flag or seg.note:
+                clear_act = QAction("Clear flag and note", menu)
+                clear_act.triggered.connect(lambda _=False, s=seg: self._set_flag(s, "", clear_note=True))
+                menu.addAction(clear_act)
+
+        menu.exec(self.text_edit.viewport().mapToGlobal(pos))
+
+    def _set_flag(self, segment, kind: str, clear_note: bool = False) -> None:
+        """Set or clear a segment's flag, log it, and refresh visuals."""
+        prev = segment.flag or "(none)"
+        segment.flag = kind
+        if clear_note:
+            segment.note = ""
+        new = kind or "(cleared)"
+        # Log to audit trail at document level
+        self.doc.log(
+            "Flag changed",
+            f"@ {fmt_timestamp(segment.start)}: {prev} → {new}",
+        )
+        self._refresh_extra_selections()
+        self._refresh_flag_button()
+
+    def _edit_note(self, segment) -> None:
+        """Prompt the user for a free-form note attached to a segment."""
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Segment note",
+            f"Note for segment at {fmt_timestamp(segment.start)}:",
+            segment.note,
+        )
+        if not ok:
+            return
+        segment.note = text.strip()
+        self.doc.log(
+            "Note edited",
+            f"@ {fmt_timestamp(segment.start)} ({len(segment.note)} chars)",
+        )
+        self._refresh_flag_button()
+
+    def _refresh_flag_button(self) -> None:
+        """Update the 'Flags ▾' button label with the current count."""
+        if not hasattr(self, "btn_flags"):
+            return
+        count = sum(1 for s in self.doc.segments if s.flag)
+        self.btn_flags.setText(f"Flags  ({count})  ▾" if count else "Flags  ▾")
+        self.btn_flags.setEnabled(count > 0 or True)  # always enabled (menu shows hint)
+
+    def _open_flags_menu(self) -> None:
+        """Build & show the Flags menu — one entry per flagged segment,
+        sorted by timestamp; selecting one jumps the cursor + playback."""
+        menu = QMenu(self.btn_flags)
+        flagged = [s for s in self.doc.segments if s.flag]
+        flagged.sort(key=lambda s: s.start)
+
+        if not flagged:
+            act = QAction("(no flagged segments — right-click a line to flag it)", menu)
+            act.setEnabled(False)
+            menu.addAction(act)
+        else:
+            for seg in flagged:
+                label, _bg, _accent = FLAG_DISPLAY.get(seg.flag, ("?", "", ""))
+                snippet = (seg.text[:50] + "…") if len(seg.text) > 50 else seg.text
+                title = f"●  [{fmt_timestamp(seg.start)}]  {label}: {snippet}"
+                if seg.note:
+                    title += f"   📝"
+                act = QAction(title, menu)
+                act.setToolTip(seg.note if seg.note else "")
+                act.triggered.connect(lambda _=False, s=seg: self._jump_to_segment(s))
+                menu.addAction(act)
+
+        menu.exec(self.btn_flags.mapToGlobal(self.btn_flags.rect().bottomLeft()))
+
+    def _jump_to_segment(self, segment) -> None:
+        """Move cursor to the segment's line and seek playback there."""
+        doc = self.text_edit.document()
+        for i in range(doc.blockCount()):
+            parsed = parse_line(doc.findBlockByNumber(i).text())
+            if parsed and parsed[0] == segment.start and parsed[1] == segment.end:
+                cursor = QTextCursor(doc.findBlockByNumber(i))
+                self.text_edit.setTextCursor(cursor)
+                self.text_edit.ensureCursorVisible()
+                self.player.seek(int(segment.start * 1000))
+                break
+
+    # -- Speaker management --------------------------------------------------
+
+    def _open_speaker_manager(self) -> None:
+        """Open the speaker rename/merge dialog. On Apply, re-render the
+        transcript so the new labels show up immediately."""
+        # Make sure model reflects current editor state before we operate
+        self._sync_text_to_model()
+        dlg = SpeakerManagerDialog(self.doc.segments, parent=self)
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            mapping = dlg.rename_map()
+            if mapping:
+                self.doc.log(
+                    "Speakers renamed",
+                    "; ".join(f"{k} → {v}" for k, v in mapping.items()),
+                )
+                self._render_transcript()

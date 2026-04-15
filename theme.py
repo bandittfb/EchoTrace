@@ -70,7 +70,10 @@ QLabel#dropzone[dragOver="true"] {{
 }}
 
 QPushButton {{
-    background-color: {BG_INPUT};
+    /* Subtle vertical gradient gives buttons a touch of dimensionality
+       without crossing into "skeuomorphic 2008" territory. */
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #16294F, stop:1 {BG_INPUT});
     color: {TEXT_PRIMARY};
     border: 1px solid {BORDER};
     border-radius: 6px;
@@ -80,8 +83,9 @@ QPushButton {{
 }}
 
 QPushButton:hover {{
-    background-color: {ACCENT};
-    border-color: {ACCENT};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 {ACCENT_HOVER}, stop:1 {ACCENT});
+    border-color: {ACCENT_HOVER};
 }}
 
 QPushButton:pressed {{
@@ -93,6 +97,12 @@ QPushButton:checked {{
     border-color: {ACCENT};
 }}
 
+QPushButton:disabled {{
+    background: {BG_INPUT};
+    color: {TEXT_SECONDARY};
+    border-color: {BORDER};
+}}
+
 QPushButton#exportBtn {{
     background-color: {BG_INPUT};
     border: 1px solid {BORDER};
@@ -101,6 +111,26 @@ QPushButton#exportBtn {{
 
 QPushButton#exportBtn:hover {{
     background-color: {ACCENT};
+}}
+
+QPushButton#exportBtn::menu-indicator {{
+    /* Hide the default Qt menu arrow — the unicode ▾ in the label is
+       cleaner and scales with the font. */
+    image: none;
+    width: 0;
+}}
+
+QPushButton#primaryBtn {{
+    background-color: {ACCENT};
+    color: white;
+    border: 1px solid {ACCENT};
+    padding: 6px 14px;
+    font-weight: bold;
+}}
+
+QPushButton#primaryBtn:hover {{
+    background-color: {ACCENT_HOVER};
+    border-color: {ACCENT_HOVER};
 }}
 
 QPushButton#playBtn {{
@@ -147,10 +177,10 @@ QProgressBar {{
 QProgressBar::chunk {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 {ACCENT}, stop:1 #FF6B81);
-    border-radius: 7px;
+    border-radius: 4px;
 }}
 
-QPlainTextEdit {{
+QPlainTextEdit, QTextEdit {{
     background-color: {BG_PANEL};
     color: {TEXT_PRIMARY};
     border: 1px solid {BORDER};
@@ -160,6 +190,54 @@ QPlainTextEdit {{
     font-family: 'Consolas', 'Courier New', monospace;
     font-size: 12px;
     line-height: 1.5;
+}}
+
+QPlainTextEdit:focus, QTextEdit:focus {{
+    border-color: {TEXT_TIMESTAMP};
+}}
+
+/* Slightly deeper, larger track for a more premium progress feel */
+QProgressBar {{
+    background-color: {PROGRESS_BG};
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+}}
+
+QDialog {{
+    background-color: {BG_DARK};
+    color: {TEXT_PRIMARY};
+}}
+
+QTableWidget {{
+    background-color: {BG_PANEL};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    gridline-color: {BORDER};
+    selection-background-color: {ACCENT};
+}}
+
+QHeaderView::section {{
+    background-color: {BG_INPUT};
+    color: {TEXT_PRIMARY};
+    padding: 6px 8px;
+    border: none;
+    border-right: 1px solid {BORDER};
+    border-bottom: 1px solid {BORDER};
+    font-weight: bold;
+    font-size: 11px;
+}}
+
+QLineEdit {{
+    background-color: {BG_PANEL};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 4px 6px;
+}}
+
+QLineEdit:focus {{
+    border-color: {TEXT_TIMESTAMP};
 }}
 
 QSlider::groove:horizontal {{
