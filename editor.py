@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QFrame,
@@ -77,6 +77,7 @@ class CorrectionEditor(QWidget):
         self._search_matches: list[tuple[int, int]] = []  # (start, end) char positions
         self._search_idx = -1
         self._search_query = ""
+        self._segment_selection: QTextEdit.ExtraSelection | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -646,24 +647,9 @@ class CorrectionEditor(QWidget):
             self._search_matches.append((cursor.selectionStart(), cursor.selectionEnd()))
 
     def _apply_search_highlights(self) -> None:
-        """Paint yellow background on all matches, orange on the current one."""
-        selections: list[QTextEdit.ExtraSelection] = []
-        all_match_fmt = QTextCharFormat()
-        all_match_fmt.setBackground(QColor("#FFEB3B"))   # bright yellow
-        all_match_fmt.setForeground(QColor("#000000"))   # ensure readable on yellow
-        current_match_fmt = QTextCharFormat()
-        current_match_fmt.setBackground(QColor("#FF9800"))  # orange for current
-        current_match_fmt.setForeground(QColor("#000000"))
-
-        for i, (start, end) in enumerate(self._search_matches):
-            sel = QTextEdit.ExtraSelection()
-            sel.cursor = QTextCursor(self.text_edit.document())
-            sel.cursor.setPosition(start)
-            sel.cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            sel.format = current_match_fmt if i == self._search_idx else all_match_fmt
-            selections.append(sel)
-
-        self.text_edit.setExtraSelections(selections)
+        """Repaint search-match backgrounds (delegates to the unified
+        extra-selections refresh so segment highlight stays intact)."""
+        self._refresh_extra_selections()
 
     def _update_search_ui(self) -> None:
         total = len(self._search_matches)
@@ -718,7 +704,7 @@ class CorrectionEditor(QWidget):
         self._search_matches = []
         self._search_idx = -1
         self._search_query = ""
-        self.text_edit.setExtraSelections([])
+        self._refresh_extra_selections()  # keeps segment highlight intact
         self._update_search_ui()
         self.text_edit.setFocus()
 
@@ -886,21 +872,67 @@ class CorrectionEditor(QWidget):
     # -- Highlight current segment -------------------------------------------
 
     def _highlight_segment(self, idx: int) -> None:
-        self._block_sync = True
+        """Highlight the currently-playing segment using an ExtraSelection.
 
-        cursor = self.text_edit.textCursor()
-        cursor.select(QTextCursor.SelectionType.Document)
-        normal_fmt = QTextBlockFormat()
-        normal_fmt.setBackground(QColor(BG_PANEL))
-        cursor.setBlockFormat(normal_fmt)
-
+        This is purely visual — it does NOT modify the document, so it
+        doesn't pollute the undo stack. (The previous implementation used
+        cursor.setBlockFormat() which counted as a document edit and made
+        Ctrl+Z undo the highlight instead of the user's typing.)
+        """
         if 0 <= idx < self.text_edit.blockCount():
             block = self.text_edit.document().findBlockByNumber(idx)
-            cursor = QTextCursor(block)
-            fmt = QTextBlockFormat()
-            fmt.setBackground(QColor(SEGMENT_HIGHLIGHT))
-            cursor.setBlockFormat(fmt)
-            self.text_edit.setTextCursor(cursor)
-            self.text_edit.ensureCursorVisible()
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = QTextCursor(block)
+            sel.format = QTextCharFormat()
+            sel.format.setBackground(QColor(SEGMENT_HIGHLIGHT))
+            # Spans the full line width regardless of cursor position
+            sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            self._segment_selection = sel
+            # Auto-scroll to keep the playhead line visible — but only if
+            # the user isn't actively editing, so we don't yank their cursor
+            # mid-keystroke.
+            if not self.text_edit.hasFocus():
+                self._scroll_to_block(idx)
+        else:
+            self._segment_selection = None
 
-        self._block_sync = False
+        self._refresh_extra_selections()
+
+    def _scroll_to_block(self, block_number: int) -> None:
+        """Scroll the viewport so the given block is visible, without
+        moving the user's text cursor."""
+        block = self.text_edit.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return
+        layout = self.text_edit.document().documentLayout()
+        rect = layout.blockBoundingRect(block)
+        viewport_h = self.text_edit.viewport().height()
+        scroll = self.text_edit.verticalScrollBar()
+        block_top = rect.y()
+        block_bottom = block_top + rect.height()
+        if block_top < scroll.value() or block_bottom > scroll.value() + viewport_h:
+            # Center the block in the viewport
+            scroll.setValue(int(block_top - viewport_h / 2 + rect.height() / 2))
+
+    def _refresh_extra_selections(self) -> None:
+        """Combine the segment highlight and all search match highlights
+        into a single setExtraSelections call. Order matters: segment
+        highlight goes first (drawn underneath), search matches on top."""
+        selections: list[QTextEdit.ExtraSelection] = []
+        if self._segment_selection is not None:
+            selections.append(self._segment_selection)
+        if self._search_query and self._search_matches:
+            all_match_fmt = QTextCharFormat()
+            all_match_fmt.setBackground(QColor("#FFEB3B"))
+            all_match_fmt.setForeground(QColor("#000000"))
+            current_match_fmt = QTextCharFormat()
+            current_match_fmt.setBackground(QColor("#FF9800"))
+            current_match_fmt.setForeground(QColor("#000000"))
+            for i, (start, end) in enumerate(self._search_matches):
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = QTextCursor(self.text_edit.document())
+                sel.cursor.setPosition(start)
+                sel.cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                sel.format = current_match_fmt if i == self._search_idx else all_match_fmt
+                selections.append(sel)
+        self.text_edit.setExtraSelections(selections)
