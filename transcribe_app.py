@@ -8,8 +8,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Slot, QSize
-from PySide6.QtGui import QAction, QBrush, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPixmap
+from PySide6.QtCore import Qt, QTimer, QUrl, Slot, QSize
+from PySide6.QtGui import QAction, QBrush, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QInputDialog, QMenu
 from PySide6.QtWidgets import (
     QApplication,
@@ -646,7 +646,12 @@ class MainWindow(QMainWindow):
                 else:
                     exporter(self._doc, Path(path))
                 self._doc.log(f"Exported {suffix.lstrip('.').upper()}", path)
-                QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
+                # Hand the file off to the OS default handler — opening
+                # the export *is* the confirmation, no need for a modal.
+                # If the open fails for any reason, fall back to a popup
+                # so the user still knows it saved.
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                    QMessageBox.information(self, "Exported", f"Saved to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", str(e))
 
