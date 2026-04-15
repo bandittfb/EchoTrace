@@ -290,9 +290,13 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Load Error", str(e))
 
-    def _save_project(self) -> None:
+    def _save_project(self) -> bool:
+        """Save the current project. Returns True on a confirmed write to
+        disk, False if the user canceled the file dialog or the write
+        failed. Callers that gate destructive actions (e.g. closing the
+        document) on a successful save MUST honor this return value."""
         if not self._doc:
-            return
+            return False
         if self._editor:
             self._editor._sync_text_to_model()
         # Default save path: same folder as audio, or last project path
@@ -305,17 +309,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save EchoTrace project", default, "EchoTrace projects (*.echotrace)"
         )
-        if path:
-            try:
-                self._doc.log("Project saved", path)
-                self._doc.save_json(Path(path))
-                self._project_path = Path(path)
-                # Successful explicit save invalidates the autosave file —
-                # it's now stale and would only confuse the recovery prompt.
-                clear_autosave()
-                QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
+        if not path:
+            return False  # user canceled the file dialog
+        try:
+            self._doc.log("Project saved", path)
+            self._doc.save_json(Path(path))
+            self._project_path = Path(path)
+            # Successful explicit save invalidates the autosave file —
+            # it's now stale and would only confuse the recovery prompt.
+            clear_autosave()
+            QMessageBox.information(self, "Saved", f"Project saved to:\n{path}")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+            return False
 
     # -- Autosave + crash recovery ------------------------------------------
 
@@ -581,6 +588,17 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("background-color: #2A2A4A;")
         layout.addWidget(sep)
 
+        # If we're replacing a previous editor (e.g. user did "New File"
+        # and is now opening another transcript), tear it down explicitly
+        # before we drop the reference. Qt won't fire closeEvent when a
+        # widget is just deleteLater'd, so the pedal listener thread
+        # would otherwise keep running and double-fire on the new editor.
+        if self._editor is not None:
+            try:
+                self._editor.cleanup()
+            except Exception:
+                pass
+
         # The editor
         self._editor = CorrectionEditor(self._doc, parent=page)
         layout.addWidget(self._editor)
@@ -604,14 +622,19 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Cancel:
             return
         if reply == QMessageBox.StandardButton.Yes:
-            self._save_project()
+            # CRITICAL: if the save was canceled or failed, do NOT proceed
+            # — clearing the autosave below would discard the user's work.
+            if not self._save_project():
+                return
 
         self._stack.setCurrentIndex(0)
         self.lbl_status.setText("Ready — drop a file or click Browse to begin.")
         if self._editor:
             self._editor.player.pause()
+            # Tear down pedal listener etc. before we drop the editor.
+            self._editor.cleanup()
         # Stop autosaving and clean up the autosave file — we're back to
-        # the start screen, there's nothing to recover.
+        # the start screen, the user either saved or chose not to.
         self._autosave_timer.stop()
         clear_autosave()
 

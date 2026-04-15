@@ -581,6 +581,20 @@ class CorrectionEditor(QWidget):
 
         self.doc.segments = new_segments
 
+        # If a search is active, refresh the highlights since text changed
+        # underneath them. Without this, edits leave stale match positions
+        # and a wrong "N of M" counter until the user retypes the query.
+        if self._search_query:
+            old_idx = self._search_idx
+            self._find_all_matches()
+            # Try to keep the user near where they were
+            if self._search_matches:
+                self._search_idx = min(max(0, old_idx), len(self._search_matches) - 1)
+            else:
+                self._search_idx = -1
+            self._apply_search_highlights()
+            self._update_search_ui()
+
     def extract_rich_runs(self) -> list[list[FormattedRun]]:
         """Return per-segment B/I/U formatting captured from the editor.
 
@@ -645,18 +659,6 @@ class CorrectionEditor(QWidget):
             # mid-typing).
             runs_per_segment.append(_coalesce_runs(block_runs) if block_runs else [FormattedRun(text=text)])
         return runs_per_segment
-
-        # If a search is active, refresh the highlights since text changed
-        if self._search_query:
-            old_idx = self._search_idx
-            self._find_all_matches()
-            # Try to keep the user near where they were
-            if self._search_matches:
-                self._search_idx = min(max(0, old_idx), len(self._search_matches) - 1)
-            else:
-                self._search_idx = -1
-            self._apply_search_highlights()
-            self._update_search_ui()
 
     # -- Volume --------------------------------------------------------------
 
@@ -889,9 +891,28 @@ class CorrectionEditor(QWidget):
                 "Plug it into any USB port — Windows will recognize it automatically."
             )
 
+    def cleanup(self) -> None:
+        """Tear down background resources (pedal listener thread, audio
+        player) without requiring closeEvent() to fire.
+
+        Qt does NOT guarantee closeEvent runs when a widget is removed
+        from a layout / parent and deleteLater'd — only when it's
+        explicitly closed via close() or the OS dismisses its window.
+        Callers that swap out the editor (e.g. main window 'New File')
+        MUST call this first or the FootPedalListener thread will
+        keep running and double-handle pedal input on the next editor.
+
+        Idempotent — safe to call from cleanup() and then closeEvent().
+        """
+        if getattr(self, "_pedal", None) is not None:
+            try:
+                self._pedal.stop()
+            except Exception:
+                pass
+            self._pedal = None
+
     def closeEvent(self, event) -> None:
-        if hasattr(self, "_pedal"):
-            self._pedal.stop()
+        self.cleanup()
         super().closeEvent(event)
 
     # -- VU Meter ------------------------------------------------------------
