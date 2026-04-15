@@ -293,7 +293,7 @@ class CorrectionEditor(QWidget):
         hint_row = QHBoxLayout()
         hint_row.setContentsMargins(0, 0, 0, 0)
 
-        hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Ctrl+B/I/U Format  |  Click timestamp to seek"
+        hint_text = "F5 Play/Pause  |  F6 Rewind 5s  |  F7 Forward 5s  |  Ctrl+B/I/U Format  |  Click timestamp to seek  |  Click speaker to change"
         if self._is_video:
             hint_text += "  |  Drag splitter to resize video"
         hint = QLabel(hint_text)
@@ -507,6 +507,15 @@ class CorrectionEditor(QWidget):
         self.text_edit.cursorPositionChanged.connect(self._update_format_buttons)
         self.text_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.text_edit.customContextMenuRequested.connect(self._on_text_context_menu)
+
+        # Speaker hover affordance: cursor turns into a hand over speaker
+        # names, signaling "click to change speaker." Mouse tracking has to
+        # be on at both the QTextEdit and its viewport, otherwise move
+        # events only fire while a button is held.
+        self.text_edit.setMouseTracking(True)
+        self.text_edit.viewport().setMouseTracking(True)
+        self._orig_mouse_move = self.text_edit.mouseMoveEvent
+        self.text_edit.mouseMoveEvent = self._on_text_mouse_move
 
         # Formatting toolbar
         self.btn_bold.clicked.connect(self._toggle_bold)
@@ -936,22 +945,77 @@ class CorrectionEditor(QWidget):
         level = self._level_provider.level_at(seconds, vol_mult)
         self._vu_meter.set_level(level)
 
-    # -- Click to seek -------------------------------------------------------
+    # -- Click to seek / change speaker --------------------------------------
 
     def _on_text_click(self, event) -> None:
         QTextEdit.mouseReleaseEvent(self.text_edit, event)
+        # Only intercept plain left-clicks. Anything with modifiers, or
+        # right-clicks, or middle-clicks fall through to default behavior
+        # (e.g. context menu, paste, native selection extend).
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
         cursor = self.text_edit.cursorForPosition(event.pos())
         col = cursor.positionInBlock()
+        block = cursor.block()
+        block_text = block.text()
+        parsed = parse_line(block_text)
+        if not parsed:
+            return
+        start, end, _speaker, _text = parsed
 
-        # Only seek if clicking in the timestamp portion (first ~25 chars)
+        # Speaker click takes priority over timestamp click — the speaker
+        # name sits *after* the timestamp, so the column ranges don't
+        # overlap, but we check it first for clarity.
+        sp_range = self._speaker_range_in_block(block_text)
+        if sp_range and sp_range[0] <= col <= sp_range[1]:
+            seg = self._segment_at_cursor(cursor)
+            if seg is not None:
+                global_pos = self.text_edit.viewport().mapToGlobal(event.pos())
+                self._open_speaker_menu_for_segment(seg, global_pos)
+            return
+
+        # Timestamp click → seek (first ~25 chars covers `[HH:MM:SS -> HH:MM:SS]`)
         if col < 25:
-            block = cursor.block()
-            parsed = parse_line(block.text())
-            if parsed:
-                start, end, speaker, text = parsed
-                self.player.seek(int(start * 1000))
-                if not self.player.is_playing:
-                    self.player.play()
+            self.player.seek(int(start * 1000))
+            if not self.player.is_playing:
+                self.player.play()
+
+    def _on_text_mouse_move(self, event) -> None:
+        """Hover affordance: turn the cursor into a hand over speaker names
+        so the click target is discoverable. Falls back to the standard
+        I-beam everywhere else."""
+        self._orig_mouse_move(event)
+        cursor = self.text_edit.cursorForPosition(event.pos())
+        col = cursor.positionInBlock()
+        block_text = cursor.block().text()
+        sp_range = self._speaker_range_in_block(block_text)
+        if sp_range and sp_range[0] <= col <= sp_range[1]:
+            self.text_edit.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.text_edit.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+
+    @staticmethod
+    def _speaker_range_in_block(block_text: str):
+        """Return ``(start_col, end_col)`` for the speaker portion of a
+        rendered transcript line, or ``None`` if no speaker is present.
+
+        Range is inclusive of leading whitespace right after the closing
+        bracket — that gives the user a forgiving click target. The end
+        is the column of the colon (exclusive of the colon itself).
+        Mirrors the same 1..40 char heuristic that ``parse_line`` uses
+        so we don't false-trigger on text lines that happen to contain
+        a colon.
+        """
+        ts_end = block_text.find("]")
+        if ts_end < 0:
+            return None
+        colon_pos = block_text.find(":", ts_end + 1)
+        if colon_pos < 0:
+            return None
+        raw = block_text[ts_end + 1:colon_pos].strip()
+        if not (1 <= len(raw) <= 40):
+            return None
+        return (ts_end + 1, colon_pos)
 
     # -- Playback callbacks --------------------------------------------------
 
@@ -1181,6 +1245,14 @@ class CorrectionEditor(QWidget):
 
         if seg is not None:
             menu.addSeparator()
+            # Speaker submenu — same content as the click-the-name menu,
+            # but reachable via right-click for lines that don't have a
+            # speaker yet (no clickable name to land on).
+            speaker_menu = menu.addMenu(
+                f"Set speaker  (current: {seg.speaker or '—'})"
+            )
+            self._populate_speaker_menu(speaker_menu, seg)
+
             flag_menu = menu.addMenu("Flag segment as...")
             for kind in ("inaudible", "admission", "contradiction", "follow_up", "custom"):
                 label, _bg, accent = FLAG_DISPLAY[kind]
@@ -1280,6 +1352,140 @@ class CorrectionEditor(QWidget):
                 self.text_edit.ensureCursorVisible()
                 self.player.seek(int(segment.start * 1000))
                 break
+
+    # -- Per-line speaker change --------------------------------------------
+
+    # Quick-add labels offered in the per-line menu when the user wants a
+    # standard role. We only offer one not already in use; "Officer 1"
+    # auto-bumps to "Officer 2" if Officer 1 already exists.
+    _QUICK_ADD_ROLES = ("Officer", "Witness", "Suspect", "Detective")
+
+    def _existing_speakers_with_counts(self) -> list[tuple[str, int]]:
+        """Return [(speaker, count), ...] sorted by count desc, name asc.
+        Empty speakers are excluded."""
+        counts: dict[str, int] = {}
+        for s in self.doc.segments:
+            if s.speaker:
+                counts[s.speaker] = counts.get(s.speaker, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
+    def _next_role_label(self, role: str) -> str:
+        """Return ``role`` if not already in use, else ``role 2``, ``role 3``…"""
+        existing = {s.speaker for s in self.doc.segments if s.speaker}
+        if role not in existing:
+            return role
+        i = 2
+        while f"{role} {i}" in existing:
+            i += 1
+        return f"{role} {i}"
+
+    def _open_speaker_menu_for_segment(self, segment, global_pos) -> None:
+        """Pop the per-line speaker chooser at *global_pos*."""
+        menu = QMenu(self)
+        self._populate_speaker_menu(menu, segment)
+        menu.exec(global_pos)
+
+    def _populate_speaker_menu(self, menu: QMenu, segment) -> None:
+        """Fill *menu* with: existing speakers (sorted by frequency, current
+        one checked) → quick-add roles → New… → Clear. Used by both the
+        click-the-name popup and the right-click submenu."""
+        existing = self._existing_speakers_with_counts()
+        current = segment.speaker
+
+        if existing:
+            for name, count in existing:
+                act = QAction(f"{name}  ({count})", menu)
+                act.setCheckable(True)
+                act.setChecked(name == current)
+                act.triggered.connect(
+                    lambda _checked=False, s=segment, n=name: self._set_segment_speaker(s, n)
+                )
+                menu.addAction(act)
+            menu.addSeparator()
+
+        # Quick-add roles (skip ones already in use to avoid duplicate clutter)
+        existing_names = {n for n, _ in existing}
+        any_quick = False
+        for role in self._QUICK_ADD_ROLES:
+            label = self._next_role_label(role)
+            if label in existing_names:
+                continue
+            any_quick = True
+            act = QAction(f"+ {label}", menu)
+            act.triggered.connect(
+                lambda _checked=False, s=segment, n=label: self._set_segment_speaker(s, n)
+            )
+            menu.addAction(act)
+        if any_quick:
+            menu.addSeparator()
+
+        new_act = QAction("New speaker name…", menu)
+        new_act.triggered.connect(lambda _=False, s=segment: self._prompt_new_speaker(s))
+        menu.addAction(new_act)
+
+        if current:
+            clear_act = QAction("Clear speaker", menu)
+            clear_act.triggered.connect(lambda _=False, s=segment: self._set_segment_speaker(s, ""))
+            menu.addAction(clear_act)
+
+    def _prompt_new_speaker(self, segment) -> None:
+        """Prompt for a new speaker name and apply it to a single segment."""
+        text, ok = QInputDialog.getText(
+            self, "New speaker", "Speaker name:", text=segment.speaker or "",
+        )
+        if not ok:
+            return
+        name = text.strip().rstrip(":")  # colon would break parse_line
+        if not name:
+            return
+        self._set_segment_speaker(segment, name)
+
+    def _set_segment_speaker(self, segment, new_speaker: str) -> None:
+        """Update one segment's speaker, re-render only that line, log it."""
+        prev = segment.speaker or "(none)"
+        new = new_speaker or "(cleared)"
+        if prev == new:
+            return  # no-op; don't pollute the audit log
+        segment.speaker = new_speaker
+        self._replace_block_for_segment(segment)
+        self.doc.log(
+            "Speaker changed",
+            f"@ {fmt_timestamp(segment.start)}: {prev} → {new}",
+        )
+
+    def _replace_block_for_segment(self, segment) -> None:
+        """Rewrite the block whose timestamps match *segment* with a fresh
+        format_line() output. Preserves cursor position and undo for other
+        blocks (only this block goes onto the undo stack)."""
+        doc = self.text_edit.document()
+        for i in range(doc.blockCount()):
+            block = doc.findBlockByNumber(i)
+            parsed = parse_line(block.text())
+            if not parsed:
+                continue
+            if parsed[0] == segment.start and parsed[1] == segment.end:
+                new_text = format_line(
+                    segment.start, segment.end, segment.text, segment.speaker,
+                )
+                # Suppress sync — we already updated the model directly.
+                # Otherwise textChanged would round-trip and rebuild.
+                self._block_sync = True
+                cursor = QTextCursor(block)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                cursor.movePosition(
+                    QTextCursor.MoveOperation.EndOfBlock,
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+                cursor.insertText(new_text)
+                self._block_sync = False
+                # Search highlights might point at moved character offsets
+                # within this block — refresh them defensively.
+                self._refresh_extra_selections()
+                if self._search_query:
+                    self._find_all_matches()
+                    self._apply_search_highlights()
+                    self._update_search_ui()
+                return
 
     # -- Speaker management --------------------------------------------------
 
