@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -70,6 +71,7 @@ class CorrectionEditor(QWidget):
         self._is_video = self._detect_video()
         self._volume_pct = 80  # default 80%
         self._level_provider = AudioLevelProvider()
+        self._pedal_momentary = True  # hold center to play (Express Scribe default)
 
         self._build_ui()
         self._connect_signals()
@@ -90,8 +92,10 @@ class CorrectionEditor(QWidget):
         # Start foot pedal listener
         self._pedal = FootPedalListener(self)
         self._pedal.pressed.connect(self._on_pedal_pressed)
+        self._pedal.released.connect(self._on_pedal_released)
         self._pedal.connected.connect(self._on_pedal_connected)
         self._pedal.disconnected.connect(self._on_pedal_disconnected)
+        self.chk_pedal_hold.toggled.connect(self._on_pedal_mode_changed)
         self._pedal.start()
 
     def _detect_video(self) -> bool:
@@ -281,7 +285,20 @@ class CorrectionEditor(QWidget):
 
         hint_row.addStretch()
 
-        # Foot pedal status indicator
+        # Foot pedal: mode toggle + status indicator
+        self.chk_pedal_hold = QCheckBox("Hold to play")
+        self.chk_pedal_hold.setChecked(True)  # momentary = Express Scribe default
+        self.chk_pedal_hold.setToolTip(
+            "Center pedal behaviour:\n"
+            "  Checked (momentary): hold to play, release to pause\n"
+            "  Unchecked (toggle):  press once to play, press again to pause"
+        )
+        self.chk_pedal_hold.setStyleSheet(
+            f"QCheckBox {{ color: {TEXT_SECONDARY}; font-size: 10px; spacing: 4px; }}"
+            f"QCheckBox::indicator {{ width: 12px; height: 12px; }}"
+        )
+        hint_row.addWidget(self.chk_pedal_hold)
+
         self.lbl_pedal = QLabel("○ Pedal scanning…")
         self.lbl_pedal.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
         self.lbl_pedal.setToolTip("Scanning for a connected USB foot pedal…")
@@ -505,13 +522,29 @@ class CorrectionEditor(QWidget):
     # -- Foot pedal ---------------------------------------------------------
 
     def _on_pedal_pressed(self, button: int) -> None:
-        """Default Express Scribe mapping: L=rewind, C=play/pause, R=forward."""
+        """Express Scribe mapping: L=rewind, C=play/pause, R=forward.
+
+        Center pedal behaviour depends on the 'Hold to play' setting:
+          - momentary (default): press starts playback, release pauses
+          - toggle: press flips play/pause state
+        """
         if button == PedalButton.LEFT:
             self.player.rewind(5000)
         elif button == PedalButton.CENTER:
-            self.player.toggle()
+            if self._pedal_momentary:
+                self.player.play()
+            else:
+                self.player.toggle()
         elif button == PedalButton.RIGHT:
             self.player.forward(5000)
+
+    def _on_pedal_released(self, button: int) -> None:
+        """In momentary mode, releasing the center pedal pauses playback."""
+        if button == PedalButton.CENTER and self._pedal_momentary:
+            self.player.pause()
+
+    def _on_pedal_mode_changed(self, checked: bool) -> None:
+        self._pedal_momentary = checked
 
     def _on_pedal_connected(self, name: str) -> None:
         if hasattr(self, "lbl_pedal"):
