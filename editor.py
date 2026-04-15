@@ -8,7 +8,6 @@ from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -24,6 +23,7 @@ from audio_player import AudioPlayer
 from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
 from pedal import FootPedalListener, PedalButton
 from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
+from toggle_switch import ToggleSwitch
 from vu_meter import AudioLevelProvider, VUMeter
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
@@ -95,7 +95,7 @@ class CorrectionEditor(QWidget):
         self._pedal.released.connect(self._on_pedal_released)
         self._pedal.connected.connect(self._on_pedal_connected)
         self._pedal.disconnected.connect(self._on_pedal_disconnected)
-        self.chk_pedal_hold.toggled.connect(self._on_pedal_mode_changed)
+        self.switch_pedal_hold.toggled.connect(self._on_pedal_mode_changed)
         self._pedal.start()
 
     def _detect_video(self) -> bool:
@@ -285,19 +285,24 @@ class CorrectionEditor(QWidget):
 
         hint_row.addStretch()
 
-        # Foot pedal: mode toggle + status indicator
-        self.chk_pedal_hold = QCheckBox("Hold to play")
-        self.chk_pedal_hold.setChecked(True)  # momentary = Express Scribe default
-        self.chk_pedal_hold.setToolTip(
+        # Foot pedal: mode label + slider switch + status indicator
+        self.lbl_pedal_mode = QLabel("Hold to play")
+        self.lbl_pedal_mode.setStyleSheet(
+            f"color: #00E676; font-size: 10px; font-weight: bold;"
+        )
+        hint_row.addWidget(self.lbl_pedal_mode)
+
+        self.switch_pedal_hold = ToggleSwitch()
+        self.switch_pedal_hold.setChecked(True)  # momentary = Express Scribe default
+        self.switch_pedal_hold.setFixedSize(36, 18)
+        self.switch_pedal_hold.setToolTip(
             "Center pedal behaviour:\n"
-            "  Checked (momentary): hold to play, release to pause\n"
-            "  Unchecked (toggle):  press once to play, press again to pause"
+            "  ON (green):   Hold to play — release to pause\n"
+            "  OFF (gray):   Continuous play — press once to play, again to pause"
         )
-        self.chk_pedal_hold.setStyleSheet(
-            f"QCheckBox {{ color: {TEXT_SECONDARY}; font-size: 10px; spacing: 4px; }}"
-            f"QCheckBox::indicator {{ width: 12px; height: 12px; }}"
-        )
-        hint_row.addWidget(self.chk_pedal_hold)
+        hint_row.addWidget(self.switch_pedal_hold)
+
+        hint_row.addSpacing(10)
 
         self.lbl_pedal = QLabel("○ Pedal scanning…")
         self.lbl_pedal.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
@@ -545,6 +550,16 @@ class CorrectionEditor(QWidget):
 
     def _on_pedal_mode_changed(self, checked: bool) -> None:
         self._pedal_momentary = checked
+        if checked:
+            self.lbl_pedal_mode.setText("Hold to play")
+            self.lbl_pedal_mode.setStyleSheet(
+                f"color: #00E676; font-size: 10px; font-weight: bold;"
+            )
+        else:
+            self.lbl_pedal_mode.setText("Continuous play")
+            self.lbl_pedal_mode.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 10px;"
+            )
 
     def _on_pedal_connected(self, name: str) -> None:
         if hasattr(self, "lbl_pedal"):
