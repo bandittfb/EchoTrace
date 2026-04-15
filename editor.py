@@ -5,12 +5,13 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSlider,
     QSplitter,
@@ -72,6 +73,9 @@ class CorrectionEditor(QWidget):
         self._volume_pct = 80  # default 80%
         self._level_provider = AudioLevelProvider()
         self._pedal_momentary = True  # hold center to play (Express Scribe default)
+        self._search_matches: list[tuple[int, int]] = []  # (start, end) char positions
+        self._search_idx = -1
+        self._search_query = ""
 
         self._build_ui()
         self._connect_signals()
@@ -243,6 +247,7 @@ class CorrectionEditor(QWidget):
             )
             header_row.addWidget(transcript_header)
             header_row.addStretch()
+            header_row.addLayout(self._build_search_bar())
             header_row.addLayout(self._build_format_toolbar())
             transcript_layout.addLayout(header_row)
 
@@ -263,6 +268,7 @@ class CorrectionEditor(QWidget):
             toolbar_row = QHBoxLayout()
             toolbar_row.setContentsMargins(0, 0, 0, 0)
             toolbar_row.addStretch()
+            toolbar_row.addLayout(self._build_search_bar())
             toolbar_row.addLayout(self._build_format_toolbar())
             root.addLayout(toolbar_row)
 
@@ -310,6 +316,65 @@ class CorrectionEditor(QWidget):
         hint_row.addWidget(self.lbl_pedal)
 
         root.addLayout(hint_row)
+
+    def _build_search_bar(self) -> QHBoxLayout:
+        """Build the find-in-transcript bar: input, counter, prev/next, clear."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.setContentsMargins(0, 0, 0, 0)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Find…")
+        self.search_input.setFixedSize(160, 26)
+        self.search_input.setStyleSheet(
+            f"QLineEdit {{"
+            f"  background-color: {BG_PANEL}; color: {TEXT_PRIMARY};"
+            f"  border: 1px solid {ACCENT}; border-radius: 4px;"
+            f"  padding: 2px 6px; font-size: 11px;"
+            f"  selection-background-color: {ACCENT};"
+            f"}}"
+        )
+        self.search_input.setToolTip("Find in transcript (Ctrl+F). Esc to clear.")
+        row.addWidget(self.search_input)
+
+        self.lbl_search_count = QLabel("0/0")
+        self.lbl_search_count.setFixedWidth(44)
+        self.lbl_search_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_search_count.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; font-family: 'Segoe UI';"
+        )
+        row.addWidget(self.lbl_search_count)
+
+        nav_css = "QPushButton { padding: 2px; min-width: 0; font-size: 12px; }"
+
+        self.btn_search_prev = QPushButton("◀")
+        self.btn_search_prev.setToolTip("Previous match (Shift+F3)")
+        self.btn_search_prev.setFixedSize(26, 26)
+        self.btn_search_prev.setStyleSheet(nav_css)
+        self.btn_search_prev.setEnabled(False)
+        row.addWidget(self.btn_search_prev)
+
+        self.btn_search_next = QPushButton("▶")
+        self.btn_search_next.setToolTip("Next match (F3)")
+        self.btn_search_next.setFixedSize(26, 26)
+        self.btn_search_next.setStyleSheet(nav_css)
+        self.btn_search_next.setEnabled(False)
+        row.addWidget(self.btn_search_next)
+
+        self.btn_search_clear = QPushButton("✕")
+        self.btn_search_clear.setToolTip("Clear search (Esc)")
+        self.btn_search_clear.setFixedSize(26, 26)
+        self.btn_search_clear.setStyleSheet(nav_css)
+        row.addWidget(self.btn_search_clear)
+
+        # Visual separator between search and formatting toolbars
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFixedHeight(20)
+        sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        row.addWidget(sep)
+
+        return row
 
     def _build_format_toolbar(self) -> QHBoxLayout:
         """Build the B/I/U + Undo/Redo/Clear toolbar. Uses QFont on the buttons
@@ -411,10 +476,22 @@ class CorrectionEditor(QWidget):
         self.btn_redo.clicked.connect(self.text_edit.redo)
         self.btn_clear_fmt.clicked.connect(self._clear_formatting)
 
+        # Search bar
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.search_input.returnPressed.connect(self._search_next)
+        self.btn_search_next.clicked.connect(self._search_next)
+        self.btn_search_prev.clicked.connect(self._search_prev)
+        self.btn_search_clear.clicked.connect(self._clear_search)
+
     def _register_hotkeys(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_F5), self, self.player.toggle, context=Qt.ShortcutContext.WindowShortcut)
         QShortcut(QKeySequence(Qt.Key.Key_F6), self, lambda: self.player.rewind(5000), context=Qt.ShortcutContext.WindowShortcut)
         QShortcut(QKeySequence(Qt.Key.Key_F7), self, lambda: self.player.forward(5000), context=Qt.ShortcutContext.WindowShortcut)
+        # Search shortcuts
+        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search, context=Qt.ShortcutContext.WindowShortcut)
+        QShortcut(QKeySequence(Qt.Key.Key_F3), self, self._search_next, context=Qt.ShortcutContext.WindowShortcut)
+        QShortcut(QKeySequence("Shift+F3"), self, self._search_prev, context=Qt.ShortcutContext.WindowShortcut)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search_input, self._clear_search, context=Qt.ShortcutContext.WidgetShortcut)
 
     # -- Render transcript ---------------------------------------------------
 
@@ -446,6 +523,18 @@ class CorrectionEditor(QWidget):
             new_segments.append(Segment(start=start, end=end, text=text, speaker=speaker))
 
         self.doc.segments = new_segments
+
+        # If a search is active, refresh the highlights since text changed
+        if self._search_query:
+            old_idx = self._search_idx
+            self._find_all_matches()
+            # Try to keep the user near where they were
+            if self._search_matches:
+                self._search_idx = min(max(0, old_idx), len(self._search_matches) - 1)
+            else:
+                self._search_idx = -1
+            self._apply_search_highlights()
+            self._update_search_ui()
 
     # -- Volume --------------------------------------------------------------
 
@@ -525,6 +614,113 @@ class CorrectionEditor(QWidget):
         self.btn_bold.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
         self.btn_italic.setChecked(fmt.fontItalic())
         self.btn_underline.setChecked(fmt.fontUnderline())
+
+    # -- Find in transcript --------------------------------------------------
+
+    def _focus_search(self) -> None:
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self._search_query = text
+        self._find_all_matches()
+        # When typing, jump to the first match (not the previous "current")
+        self._search_idx = 0 if self._search_matches else -1
+        self._apply_search_highlights()
+        self._update_search_ui()
+        if self._search_idx >= 0:
+            self._scroll_to_current_match()
+
+    def _find_all_matches(self) -> None:
+        """Scan the document for all occurrences of the query (case-insensitive)."""
+        self._search_matches = []
+        if not self._search_query:
+            return
+        doc = self.text_edit.document()
+        cursor = QTextCursor(doc)
+        # Case-insensitive find. Pass 0 flags = no case sensitivity by default.
+        while True:
+            cursor = doc.find(self._search_query, cursor)
+            if cursor.isNull():
+                break
+            self._search_matches.append((cursor.selectionStart(), cursor.selectionEnd()))
+
+    def _apply_search_highlights(self) -> None:
+        """Paint yellow background on all matches, orange on the current one."""
+        selections: list[QTextEdit.ExtraSelection] = []
+        all_match_fmt = QTextCharFormat()
+        all_match_fmt.setBackground(QColor("#FFEB3B"))   # bright yellow
+        all_match_fmt.setForeground(QColor("#000000"))   # ensure readable on yellow
+        current_match_fmt = QTextCharFormat()
+        current_match_fmt.setBackground(QColor("#FF9800"))  # orange for current
+        current_match_fmt.setForeground(QColor("#000000"))
+
+        for i, (start, end) in enumerate(self._search_matches):
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = QTextCursor(self.text_edit.document())
+            sel.cursor.setPosition(start)
+            sel.cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            sel.format = current_match_fmt if i == self._search_idx else all_match_fmt
+            selections.append(sel)
+
+        self.text_edit.setExtraSelections(selections)
+
+    def _update_search_ui(self) -> None:
+        total = len(self._search_matches)
+        if total == 0:
+            self.lbl_search_count.setText("0/0" if self._search_query else "")
+            self.lbl_search_count.setStyleSheet(
+                f"color: {'#FF1744' if self._search_query else TEXT_SECONDARY}; "
+                f"font-size: 10px; font-family: 'Segoe UI';"
+            )
+            self.btn_search_prev.setEnabled(False)
+            self.btn_search_next.setEnabled(False)
+        else:
+            self.lbl_search_count.setText(f"{self._search_idx + 1}/{total}")
+            self.lbl_search_count.setStyleSheet(
+                f"color: #00E676; font-size: 10px; font-family: 'Segoe UI'; font-weight: bold;"
+            )
+            self.btn_search_prev.setEnabled(True)
+            self.btn_search_next.setEnabled(True)
+
+    def _scroll_to_current_match(self) -> None:
+        """Move the visible cursor to the current match and ensure it's on-screen."""
+        if not (0 <= self._search_idx < len(self._search_matches)):
+            return
+        start, end = self._search_matches[self._search_idx]
+        cursor = QTextCursor(self.text_edit.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        # Don't trigger sync logic — extra selections handle the visual
+        self._block_sync = True
+        self.text_edit.setTextCursor(cursor)
+        self.text_edit.ensureCursorVisible()
+        self._block_sync = False
+
+    def _search_next(self) -> None:
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_matches)
+        self._apply_search_highlights()
+        self._update_search_ui()
+        self._scroll_to_current_match()
+
+    def _search_prev(self) -> None:
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_matches)
+        self._apply_search_highlights()
+        self._update_search_ui()
+        self._scroll_to_current_match()
+
+    def _clear_search(self) -> None:
+        self.search_input.clear()
+        self._search_matches = []
+        self._search_idx = -1
+        self._search_query = ""
+        self.text_edit.setExtraSelections([])
+        self._update_search_ui()
+        self.text_edit.setFocus()
 
     # -- Foot pedal ---------------------------------------------------------
 
