@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from audio_player import AudioPlayer
+from flow_layout import FlowLayout
 from models import TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
 from pedal import FootPedalListener, PedalButton
 from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
@@ -237,19 +238,20 @@ class CorrectionEditor(QWidget):
             transcript_layout.setContentsMargins(0, 0, 0, 0)
             transcript_layout.setSpacing(4)
 
-            # Header row: TRANSCRIPT label on left, formatting toolbar on right
-            header_row = QHBoxLayout()
-            header_row.setContentsMargins(0, 0, 0, 0)
+            # Header: TRANSCRIPT label, then a FlowLayout that wraps the
+            # search bar + format toolbar onto a second row when narrow.
             transcript_header = QLabel("TRANSCRIPT")
             transcript_header.setStyleSheet(
                 f"font-size: 9px; font-weight: bold; color: {TEXT_SECONDARY}; "
                 f"letter-spacing: 2px; padding: 2px 0;"
             )
-            header_row.addWidget(transcript_header)
-            header_row.addStretch()
-            header_row.addLayout(self._build_search_bar())
-            header_row.addLayout(self._build_format_toolbar())
-            transcript_layout.addLayout(header_row)
+            transcript_layout.addWidget(transcript_header)
+
+            toolbar_container = QWidget()
+            toolbar_flow = FlowLayout(toolbar_container, margin=0, spacing=6)
+            toolbar_flow.addWidget(self._build_search_bar())
+            toolbar_flow.addWidget(self._build_format_toolbar())
+            transcript_layout.addWidget(toolbar_container)
 
             self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
@@ -264,13 +266,13 @@ class CorrectionEditor(QWidget):
 
             root.addWidget(splitter, 1)
         else:
-            # Audio-only: toolbar on right, transcript full width below
-            toolbar_row = QHBoxLayout()
-            toolbar_row.setContentsMargins(0, 0, 0, 0)
-            toolbar_row.addStretch()
-            toolbar_row.addLayout(self._build_search_bar())
-            toolbar_row.addLayout(self._build_format_toolbar())
-            root.addLayout(toolbar_row)
+            # Audio-only: search + format toolbars in a flow layout
+            # so they wrap to a second row when the window is narrow.
+            toolbar_container = QWidget()
+            toolbar_flow = FlowLayout(toolbar_container, margin=0, spacing=6)
+            toolbar_flow.addWidget(self._build_search_bar())
+            toolbar_flow.addWidget(self._build_format_toolbar())
+            root.addWidget(toolbar_container)
 
             self.text_edit = QTextEdit()
             self.text_edit.setFont(QFont("Consolas", 11))
@@ -317,9 +319,12 @@ class CorrectionEditor(QWidget):
 
         root.addLayout(hint_row)
 
-    def _build_search_bar(self) -> QHBoxLayout:
-        """Build the find-in-transcript bar: input, counter, prev/next, clear."""
-        row = QHBoxLayout()
+    def _build_search_bar(self) -> QWidget:
+        """Build the find-in-transcript bar: input, counter, prev/next, clear.
+        Returns a self-contained QWidget so it can be placed in any layout
+        and wrap as a single unit in a FlowLayout."""
+        container = QWidget()
+        row = QHBoxLayout(container)
         row.setSpacing(4)
         row.setContentsMargins(0, 0, 0, 0)
 
@@ -367,20 +372,15 @@ class CorrectionEditor(QWidget):
         self.btn_search_clear.setStyleSheet(nav_css)
         row.addWidget(self.btn_search_clear)
 
-        # Visual separator between search and formatting toolbars
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFixedHeight(20)
-        sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        row.addWidget(sep)
+        return container
 
-        return row
-
-    def _build_format_toolbar(self) -> QHBoxLayout:
+    def _build_format_toolbar(self) -> QWidget:
         """Build the B/I/U + Undo/Redo/Clear toolbar. Uses QFont on the buttons
         so the theme's button text colour still applies (stylesheet-based
-        font styling was rendering blank buttons)."""
-        row = QHBoxLayout()
+        font styling was rendering blank buttons). Returns a self-contained
+        QWidget so it wraps as a single unit in a FlowLayout."""
+        container = QWidget()
+        row = QHBoxLayout(container)
         row.setSpacing(4)
         row.setContentsMargins(0, 0, 0, 0)
 
@@ -450,7 +450,7 @@ class CorrectionEditor(QWidget):
         self.btn_clear_fmt.setStyleSheet(medium_css)
         row.addWidget(self.btn_clear_fmt)
 
-        return row
+        return container
 
     def _connect_signals(self) -> None:
         self.btn_play.clicked.connect(self.player.toggle)
