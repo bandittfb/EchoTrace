@@ -14,7 +14,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -110,15 +109,25 @@ class SpeakerManagerDialog(QDialog):
         helper_row.addStretch()
         layout.addLayout(helper_row)
 
-        # Buttons
-        bb = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Apply
-        )
-        bb.button(QDialogButtonBox.StandardButton.Apply).setText("Apply")
-        bb.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply)
-        bb.rejected.connect(self.reject)
-        layout.addWidget(bb)
+        # Buttons — use a manual layout instead of QDialogButtonBox's
+        # built-in Apply button, which has ApplyRole quirks on Windows
+        # that can swallow clicks or silently drop the signal's bool
+        # parameter before it reaches the slot.
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(28)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.setFixedHeight(28)
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(lambda _checked=False: self._apply())
+        btn_row.addWidget(apply_btn)
+
+        layout.addLayout(btn_row)
 
     # -- Internals -----------------------------------------------------------
 

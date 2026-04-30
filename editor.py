@@ -5,8 +5,10 @@ from pathlib import Path
 
 from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem, QVideoWidget
+from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTextEdit,
     QVBoxLayout,
@@ -25,14 +28,37 @@ from audio_player import AudioPlayer
 from flow_layout import FlowLayout
 from models import FormattedRun, TranscriptDocument, fmt_timestamp, fmt_timestamp_ms
 from pedal import FootPedalListener, PedalButton
-from theme import ACCENT, BG_DARK, BG_PANEL, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
+from theme import ACCENT, BG_DARK, BG_PANEL, BORDER, SEGMENT_HIGHLIGHT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TIMESTAMP
 from speaker_dialog import SpeakerManagerDialog
 from toggle_switch import ToggleSwitch
-from transcript_format import format_line, parse_line
+from transcript_format import (
+    TRANSLATION_PREFIX,
+    format_segment,
+    parse_line,
+    parse_translation,
+)
 from vu_meter import AudioLevelProvider, VUMeter
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v"}
 SPEED_PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+# Font choices — curated for transcript readability on Windows. A mix of
+# monospaced fonts (good for timestamp alignment) and proportional fonts
+# (easier on the eyes for long reading sessions). All ship with Windows.
+FONT_FAMILIES = [
+    "Consolas",         # default — clean monospace, great with timestamps
+    "Cascadia Code",    # modern Microsoft monospace, ligatures
+    "Courier New",      # classic monospace, familiar legal/transcript feel
+    "Segoe UI",         # Windows default proportional, very readable
+    "Calibri",          # modern proportional, clean
+    "Verdana",          # designed for screen readability
+    "Arial",            # universal proportional
+]
+DEFAULT_FONT_FAMILY = "Consolas"
+DEFAULT_FONT_SIZE = 11
+# How many points the active-segment highlight adds on top of the current
+# editor font size. Keeps the "pop" proportional regardless of base size.
+HIGHLIGHT_SIZE_BUMP = 3
 
 # Flag presentation. Keys must match models.FLAG_KINDS.
 # (label, background tint, accent dot color)
@@ -66,6 +92,132 @@ def _coalesce_runs(runs: list[FormattedRun]) -> list[FormattedRun]:
     return out
 
 
+class RotatableVideoView(QGraphicsView):
+    """QGraphicsView wrapper around a QGraphicsVideoItem that supports
+    90-degree rotation and scroll-wheel zoom.
+
+    Used in place of the plain QVideoWidget so the user can correct
+    rotated body-cam / dash-cam footage and zoom into details without
+    re-encoding the file.
+
+    Controls:
+    * Scroll wheel — zoom in / out (1.0× → 5.0×)
+    * Double-click — reset to fit-to-view (1.0×)
+    * Click + drag — pan when zoomed in
+    * rotate_cw() / rotate_ccw() — 90° steps
+    """
+
+    ZOOM_MIN = 1.0
+    ZOOM_MAX = 5.0
+    ZOOM_STEP = 1.15  # each scroll notch multiplies/divides by this
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self._video_item = QGraphicsVideoItem()
+        self._scene.addItem(self._video_item)
+        self.setScene(self._scene)
+        self._rotation = 0
+        self._zoom = 1.0
+
+        # Clean look: no scrollbars, black background, no frame
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background-color: black;")
+
+        # Drag-to-pan when zoomed in
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+
+        # Refit whenever the video's native resolution becomes known
+        self._video_item.nativeSizeChanged.connect(lambda _: self._fit_video())
+
+    @property
+    def video_item(self) -> QGraphicsVideoItem:
+        return self._video_item
+
+    @property
+    def rotation_degrees(self) -> int:
+        return self._rotation
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._zoom
+
+    def rotate_cw(self) -> None:
+        """Rotate 90° clockwise."""
+        self._rotation = (self._rotation + 90) % 360
+        self._video_item.setRotation(self._rotation)
+        self._zoom = 1.0
+        self._fit_video()
+
+    def rotate_ccw(self) -> None:
+        """Rotate 90° counter-clockwise."""
+        self._rotation = (self._rotation - 90) % 360
+        self._video_item.setRotation(self._rotation)
+        self._zoom = 1.0
+        self._fit_video()
+
+    def zoom_in(self) -> None:
+        """Zoom in one step."""
+        self._apply_zoom(self._zoom * self.ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        """Zoom out one step."""
+        self._apply_zoom(self._zoom / self.ZOOM_STEP)
+
+    def zoom_reset(self) -> None:
+        """Reset to fit-to-view (1.0×)."""
+        self._zoom = 1.0
+        self._fit_video()
+
+    def _apply_zoom(self, new_zoom: float) -> None:
+        new_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, new_zoom))
+        if abs(new_zoom - self._zoom) < 0.01:
+            return
+        factor = new_zoom / self._zoom
+        self._zoom = new_zoom
+        self.scale(factor, factor)
+        # Show scrollbars only when zoomed past 1×
+        policy = (
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if self._zoom > 1.05
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.setHorizontalScrollBarPolicy(policy)
+        self.setVerticalScrollBarPolicy(policy)
+
+    def _fit_video(self) -> None:
+        rect = self._video_item.boundingRect()
+        if rect.isValid() and rect.width() > 0 and rect.height() > 0:
+            self.fitInView(self._video_item, Qt.AspectRatioMode.KeepAspectRatio)
+        # Hide scrollbars at 1× since we're fully fitted
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    # -- Qt event overrides -------------------------------------------------
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._zoom <= 1.05:
+            self._fit_video()
+
+    def wheelEvent(self, event) -> None:
+        """Scroll wheel zooms in/out instead of scrolling."""
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._apply_zoom(self._zoom * self.ZOOM_STEP)
+        elif delta < 0:
+            self._apply_zoom(self._zoom / self.ZOOM_STEP)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Double-click resets to fit-to-view."""
+        self._zoom = 1.0
+        self._fit_video()
+        super().mouseDoubleClickEvent(event)
+
+
 class CorrectionEditor(QWidget):
     """Transport controls + optional video + editable transcript."""
 
@@ -82,9 +234,12 @@ class CorrectionEditor(QWidget):
         self._search_matches: list[tuple[int, int]] = []  # (start, end) char positions
         self._search_idx = -1
         self._search_query = ""
-        self._segment_selection: QTextEdit.ExtraSelection | None = None
+        self._editor_font_family = DEFAULT_FONT_FAMILY
+        self._editor_font_size = DEFAULT_FONT_SIZE
+        self._segment_bg_selection: QTextEdit.ExtraSelection | None = None
+        self._segment_text_selection: QTextEdit.ExtraSelection | None = None
         # Animated highlight: flashes brighter when segment changes, then
-        # decays to the steady SEGMENT_HIGHLIGHT color over ~280ms.
+        # decays to the steady SEGMENT_HIGHLIGHT color over ~400ms.
         self._highlight_intensity = 0.0  # 1.0 = peak flash, 0.0 = steady
 
         self._build_ui()
@@ -225,20 +380,68 @@ class CorrectionEditor(QWidget):
             video_layout.setContentsMargins(0, 0, 0, 0)
             video_layout.setSpacing(4)
 
+            # Header row: rotate buttons flanking the "VIDEO" label
+            video_header_row = QHBoxLayout()
+            video_header_row.setSpacing(4)
+            video_header_row.setContentsMargins(0, 0, 0, 0)
+
+            video_btn_css = (
+                "QPushButton { padding: 3px; min-width: 0; font-size: 18px; "
+                f"background: transparent; color: {TEXT_SECONDARY}; border: none; }}"
+                f"QPushButton:hover {{ color: {ACCENT}; }}"
+            )
+
+            self.btn_rotate_ccw = QPushButton("⟲")
+            self.btn_rotate_ccw.setToolTip("Rotate video 90° counter-clockwise")
+            self.btn_rotate_ccw.setFixedSize(34, 30)
+            self.btn_rotate_ccw.setStyleSheet(video_btn_css)
+            self.btn_rotate_ccw.clicked.connect(lambda: self._rotate_video("ccw"))
+            video_header_row.addWidget(self.btn_rotate_ccw)
+
             video_header = QLabel("VIDEO")
             video_header.setStyleSheet(
                 f"font-size: 9px; font-weight: bold; color: {TEXT_SECONDARY}; "
                 f"letter-spacing: 2px; padding: 2px 0;"
             )
             video_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            video_layout.addWidget(video_header)
+            video_header_row.addWidget(video_header, 1)
 
-            self._video_widget = QVideoWidget()
-            self._video_widget.setMinimumSize(320, 240)
-            self._video_widget.setStyleSheet(f"background-color: black; border-radius: 4px;")
-            video_layout.addWidget(self._video_widget, 1)
+            self.btn_rotate_cw = QPushButton("⟳")
+            self.btn_rotate_cw.setToolTip("Rotate video 90° clockwise")
+            self.btn_rotate_cw.setFixedSize(34, 30)
+            self.btn_rotate_cw.setStyleSheet(video_btn_css)
+            self.btn_rotate_cw.clicked.connect(lambda: self._rotate_video("cw"))
+            video_header_row.addWidget(self.btn_rotate_cw)
 
-            self.player.set_video_output(self._video_widget)
+            # Zoom controls
+            self.btn_zoom_in = QPushButton("+")
+            self.btn_zoom_in.setToolTip("Zoom in (or scroll wheel)")
+            self.btn_zoom_in.setFixedSize(34, 30)
+            self.btn_zoom_in.setStyleSheet(video_btn_css)
+            self.btn_zoom_in.clicked.connect(lambda: self._zoom_video("in"))
+            video_header_row.addWidget(self.btn_zoom_in)
+
+            self.btn_zoom_out = QPushButton("−")
+            self.btn_zoom_out.setToolTip("Zoom out (or scroll wheel)")
+            self.btn_zoom_out.setFixedSize(34, 30)
+            self.btn_zoom_out.setStyleSheet(video_btn_css)
+            self.btn_zoom_out.clicked.connect(lambda: self._zoom_video("out"))
+            video_header_row.addWidget(self.btn_zoom_out)
+
+            self.btn_zoom_reset = QPushButton("1:1")
+            self.btn_zoom_reset.setToolTip("Reset zoom to fit (or double-click video)")
+            self.btn_zoom_reset.setFixedSize(40, 30)
+            self.btn_zoom_reset.setStyleSheet(video_btn_css)
+            self.btn_zoom_reset.clicked.connect(lambda: self._zoom_video("reset"))
+            video_header_row.addWidget(self.btn_zoom_reset)
+
+            video_layout.addLayout(video_header_row)
+
+            self._video_view = RotatableVideoView()
+            self._video_view.setMinimumSize(320, 240)
+            video_layout.addWidget(self._video_view, 1)
+
+            self.player.set_video_output(self._video_view.video_item)
             splitter.addWidget(video_container)
 
             # Transcript panel
@@ -263,7 +466,7 @@ class CorrectionEditor(QWidget):
             transcript_layout.addWidget(toolbar_container)
 
             self.text_edit = QTextEdit()
-            self.text_edit.setFont(QFont("Consolas", 11))
+            self.text_edit.setFont(QFont(self._editor_font_family, self._editor_font_size))
             self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
             self.text_edit.setAcceptRichText(True)
             transcript_layout.addWidget(self.text_edit, 1)
@@ -284,7 +487,7 @@ class CorrectionEditor(QWidget):
             root.addWidget(toolbar_container)
 
             self.text_edit = QTextEdit()
-            self.text_edit.setFont(QFont("Consolas", 11))
+            self.text_edit.setFont(QFont(self._editor_font_family, self._editor_font_size))
             self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
             self.text_edit.setAcceptRichText(True)
             root.addWidget(self.text_edit, 1)
@@ -339,12 +542,12 @@ class CorrectionEditor(QWidget):
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Find…")
-        self.search_input.setFixedSize(160, 26)
+        self.search_input.setFixedSize(190, 38)
         self.search_input.setStyleSheet(
             f"QLineEdit {{"
             f"  background-color: {BG_PANEL}; color: {TEXT_PRIMARY};"
             f"  border: 1px solid {ACCENT}; border-radius: 4px;"
-            f"  padding: 2px 6px; font-size: 11px;"
+            f"  padding: 5px 8px; font-size: 14px;"
             f"  selection-background-color: {ACCENT};"
             f"}}"
         )
@@ -355,113 +558,158 @@ class CorrectionEditor(QWidget):
         self.lbl_search_count.setFixedWidth(44)
         self.lbl_search_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_search_count.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-family: 'Segoe UI';"
+            f"color: {TEXT_SECONDARY}; font-size: 13px; font-family: 'Segoe UI';"
         )
         row.addWidget(self.lbl_search_count)
 
-        nav_css = "QPushButton { padding: 2px; min-width: 0; font-size: 12px; }"
+        nav_css = "QPushButton { padding: 4px; min-width: 0; font-size: 16px; }"
 
         self.btn_search_prev = QPushButton("◀")
         self.btn_search_prev.setToolTip("Previous match (Shift+F3)")
-        self.btn_search_prev.setFixedSize(26, 26)
+        self.btn_search_prev.setFixedSize(36, 38)
         self.btn_search_prev.setStyleSheet(nav_css)
         self.btn_search_prev.setEnabled(False)
         row.addWidget(self.btn_search_prev)
 
         self.btn_search_next = QPushButton("▶")
         self.btn_search_next.setToolTip("Next match (F3)")
-        self.btn_search_next.setFixedSize(26, 26)
+        self.btn_search_next.setFixedSize(36, 38)
         self.btn_search_next.setStyleSheet(nav_css)
         self.btn_search_next.setEnabled(False)
         row.addWidget(self.btn_search_next)
 
         self.btn_search_clear = QPushButton("✕")
         self.btn_search_clear.setToolTip("Clear search (Esc)")
-        self.btn_search_clear.setFixedSize(26, 26)
+        self.btn_search_clear.setFixedSize(36, 38)
         self.btn_search_clear.setStyleSheet(nav_css)
         row.addWidget(self.btn_search_clear)
 
         return container
 
     def _build_format_toolbar(self) -> QWidget:
-        """Build the B/I/U + Undo/Redo/Clear toolbar. Uses QFont on the buttons
-        so the theme's button text colour still applies (stylesheet-based
-        font styling was rendering blank buttons). Returns a self-contained
-        QWidget so it wraps as a single unit in a FlowLayout."""
+        """Build the font picker + B/I/U + Undo/Redo/Clear toolbar.
+
+        Layout follows the standard word-processor order:
+        Font Family | Font Size | | B I U | | Undo Redo | Clear | Flags | Speakers
+
+        Uses QFont on the buttons so the theme's button text colour still
+        applies (stylesheet-based font styling was rendering blank buttons).
+        Returns a self-contained QWidget so it wraps as a single unit in
+        a FlowLayout."""
         container = QWidget()
         row = QHBoxLayout(container)
         row.setSpacing(4)
         row.setContentsMargins(0, 0, 0, 0)
 
+        # Toolbar-wide sizing constants
+        BTN_H = 38  # uniform button height across the toolbar
+        SEP_H = 28  # separator line height
+
         # Small square buttons need reduced padding; global theme's
         # 6px 14px would clip the single-letter label.
-        compact_css = "QPushButton { padding: 2px; min-width: 0; font-size: 13px; }"
+        compact_css = f"QPushButton {{ padding: 4px; min-width: 0; font-size: 16px; }}"
         # Medium buttons: same visual language as compact, just wider for labels.
-        medium_css = "QPushButton { padding: 2px 10px; font-size: 12px; }"
+        medium_css = f"QPushButton {{ padding: 4px 14px; font-size: 14px; }}"
+        # Combo/spin styling for the font controls — larger text, more padding.
+        ctrl_css = (
+            f"QComboBox, QSpinBox {{ background-color: {BG_PANEL}; color: {TEXT_PRIMARY}; "
+            f"border: 1px solid {BORDER}; border-radius: 4px; padding: 5px 8px; font-size: 14px; }}"
+        )
 
-        bold_font = QFont("Segoe UI", 11)
+        # -- Font family picker -----------------------------------------------
+        self.combo_font = QComboBox()
+        for family in FONT_FAMILIES:
+            self.combo_font.addItem(family)
+        self.combo_font.setCurrentText(self._editor_font_family)
+        self.combo_font.setFixedHeight(BTN_H)
+        self.combo_font.setMinimumWidth(170)
+        self.combo_font.setToolTip("Editor font family")
+        self.combo_font.setStyleSheet(ctrl_css)
+        self.combo_font.currentTextChanged.connect(self._on_font_family_changed)
+        row.addWidget(self.combo_font)
+
+        # -- Font size spinner ------------------------------------------------
+        self.spin_font_size = QSpinBox()
+        self.spin_font_size.setRange(8, 28)
+        self.spin_font_size.setValue(self._editor_font_size)
+        self.spin_font_size.setSuffix("pt")
+        self.spin_font_size.setFixedHeight(BTN_H)
+        self.spin_font_size.setFixedWidth(86)
+        self.spin_font_size.setToolTip("Editor font size (use arrows or type a number)")
+        self.spin_font_size.setStyleSheet(ctrl_css)
+        self.spin_font_size.valueChanged.connect(self._on_font_size_changed)
+        row.addWidget(self.spin_font_size)
+
+        sep_font = QFrame()
+        sep_font.setFrameShape(QFrame.Shape.VLine)
+        sep_font.setFixedHeight(SEP_H)
+        sep_font.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        row.addWidget(sep_font)
+
+        # -- B / I / U --------------------------------------------------------
+        bold_font = QFont("Segoe UI", 13)
         bold_font.setBold(True)
         self.btn_bold = QPushButton("B")
         self.btn_bold.setToolTip("Bold (Ctrl+B)")
         self.btn_bold.setCheckable(True)
-        self.btn_bold.setFixedSize(32, 26)
+        self.btn_bold.setFixedSize(40, BTN_H)
         self.btn_bold.setFont(bold_font)
         self.btn_bold.setStyleSheet(compact_css)
         row.addWidget(self.btn_bold)
 
-        italic_font = QFont("Segoe UI", 11)
+        italic_font = QFont("Segoe UI", 13)
         italic_font.setItalic(True)
         self.btn_italic = QPushButton("I")
         self.btn_italic.setToolTip("Italic (Ctrl+I)")
         self.btn_italic.setCheckable(True)
-        self.btn_italic.setFixedSize(32, 26)
+        self.btn_italic.setFixedSize(40, BTN_H)
         self.btn_italic.setFont(italic_font)
         self.btn_italic.setStyleSheet(compact_css)
         row.addWidget(self.btn_italic)
 
-        underline_font = QFont("Segoe UI", 11)
+        underline_font = QFont("Segoe UI", 13)
         underline_font.setUnderline(True)
         self.btn_underline = QPushButton("U")
         self.btn_underline.setToolTip("Underline (Ctrl+U)")
         self.btn_underline.setCheckable(True)
-        self.btn_underline.setFixedSize(32, 26)
+        self.btn_underline.setFixedSize(40, BTN_H)
         self.btn_underline.setFont(underline_font)
         self.btn_underline.setStyleSheet(compact_css)
         row.addWidget(self.btn_underline)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFixedHeight(20)
+        sep.setFixedHeight(SEP_H)
         sep.setStyleSheet(f"color: {TEXT_SECONDARY};")
         row.addWidget(sep)
 
         self.btn_undo = QPushButton("↩ Undo")
         self.btn_undo.setToolTip("Undo (Ctrl+Z)")
-        self.btn_undo.setFixedSize(72, 26)
+        self.btn_undo.setFixedSize(88, BTN_H)
         self.btn_undo.setStyleSheet(medium_css)
         row.addWidget(self.btn_undo)
 
         self.btn_redo = QPushButton("↪ Redo")
         self.btn_redo.setToolTip("Redo (Ctrl+Y)")
-        self.btn_redo.setFixedSize(72, 26)
+        self.btn_redo.setFixedSize(88, BTN_H)
         self.btn_redo.setStyleSheet(medium_css)
         row.addWidget(self.btn_redo)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setFixedHeight(20)
+        sep2.setFixedHeight(SEP_H)
         sep2.setStyleSheet(f"color: {TEXT_SECONDARY};")
         row.addWidget(sep2)
 
         self.btn_clear_fmt = QPushButton("✕ Clear")
         self.btn_clear_fmt.setToolTip("Remove formatting from selection")
-        self.btn_clear_fmt.setFixedSize(72, 26)
+        self.btn_clear_fmt.setFixedSize(88, BTN_H)
         self.btn_clear_fmt.setStyleSheet(medium_css)
         row.addWidget(self.btn_clear_fmt)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.VLine)
-        sep3.setFixedHeight(20)
+        sep3.setFixedHeight(SEP_H)
         sep3.setStyleSheet(f"color: {TEXT_SECONDARY};")
         row.addWidget(sep3)
 
@@ -471,8 +719,8 @@ class CorrectionEditor(QWidget):
             "Jump to a flagged segment.\n"
             "Right-click any line in the transcript to add a flag."
         )
-        self.btn_flags.setFixedHeight(26)
-        self.btn_flags.setMinimumWidth(86)
+        self.btn_flags.setFixedHeight(BTN_H)
+        self.btn_flags.setMinimumWidth(90)
         self.btn_flags.setStyleSheet(medium_css)
         self.btn_flags.clicked.connect(self._open_flags_menu)
         row.addWidget(self.btn_flags)
@@ -482,8 +730,8 @@ class CorrectionEditor(QWidget):
         self.btn_speakers.setToolTip(
             "Rename or merge speakers across the entire transcript"
         )
-        self.btn_speakers.setFixedHeight(26)
-        self.btn_speakers.setMinimumWidth(90)
+        self.btn_speakers.setFixedHeight(BTN_H)
+        self.btn_speakers.setMinimumWidth(100)
         self.btn_speakers.setStyleSheet(medium_css)
         self.btn_speakers.clicked.connect(self._open_speaker_manager)
         row.addWidget(self.btn_speakers)
@@ -547,11 +795,18 @@ class CorrectionEditor(QWidget):
     def _render_transcript(self) -> None:
         self._block_sync = True
         self.text_edit.clear()
-        lines = [
-            format_line(seg.start, seg.end, seg.text, seg.speaker)
+        # Each segment contributes one block (main line) plus an optional
+        # second block (translation continuation). format_segment emits
+        # them as a single "\n"-separated string so the join below puts
+        # exactly one newline between every block in the final document.
+        blocks = [
+            format_segment(
+                seg.start, seg.end, seg.text, seg.speaker,
+                language=seg.language, translation=seg.translation,
+            )
             for seg in self.doc.segments
         ]
-        self.text_edit.setPlainText("\n".join(lines))
+        self.text_edit.setPlainText("\n".join(blocks))
         self._block_sync = False
         # Re-paint flag tints + update Flags button count for the loaded doc
         self._refresh_extra_selections()
@@ -566,6 +821,10 @@ class CorrectionEditor(QWidget):
         preserve them across the rebuild by keying on the (start, end)
         timestamp pair — those columns are stable as long as the user
         doesn't edit the timestamp text itself.
+
+        Translation continuation lines (indented with ``↳``) are folded
+        onto whichever main segment precedes them. This is the one place
+        where line-by-line parsing becomes stateful.
         """
         if self._block_sync:
             return
@@ -578,14 +837,28 @@ class CorrectionEditor(QWidget):
 
         new_segments: list[Segment] = []
         for line in self.text_edit.toPlainText().split("\n"):
+            # Translation line? Attach to the previous segment and move on.
+            if new_segments:
+                trans = parse_translation(line)
+                if trans is not None:
+                    # Preserve any previously-attached translation by
+                    # appending subsequent lines with a space separator —
+                    # multi-line translations aren't the common case but
+                    # shouldn't silently drop content.
+                    if new_segments[-1].translation:
+                        new_segments[-1].translation += " " + trans
+                    else:
+                        new_segments[-1].translation = trans
+                    continue
+
             parsed = parse_line(line)
             if parsed is None:
                 continue  # skip blank lines or lines without valid timestamps
-            start, end, speaker, text = parsed
+            start, end, speaker, language, text = parsed
             flag, note = old_meta.get((start, end), ("", ""))
             new_segments.append(Segment(
                 start=start, end=end, text=text, speaker=speaker,
-                flag=flag, note=note,
+                flag=flag, note=note, language=language,
             ))
 
         self.doc.segments = new_segments
@@ -604,29 +877,49 @@ class CorrectionEditor(QWidget):
             self._apply_search_highlights()
             self._update_search_ui()
 
-    def extract_rich_runs(self) -> list[list[FormattedRun]]:
+    def extract_rich_runs(self) -> tuple[list[list[FormattedRun]], list[list[FormattedRun]]]:
         """Return per-segment B/I/U formatting captured from the editor.
 
-        The result is parallel to ``self.doc.segments`` (one entry per
-        segment, in document order). Each entry is a list of
-        ``FormattedRun`` objects covering only the *text* portion of the
-        line (timestamps and speaker prefixes are skipped). Empty list if
-        the segment's plaintext was empty.
+        Returns a tuple ``(main_runs, translation_runs)``. Both lists are
+        parallel to ``self.doc.segments``:
 
-        DOCX/PDF exporters use this to re-apply Bold/Italic/Underline that
-        the user toggled in the editor. TXT/JSON exports ignore it.
+        * ``main_runs[i]`` covers only the *text* portion of segment i's
+          main line (timestamps and speaker prefixes are skipped).
+        * ``translation_runs[i]`` covers the translation continuation
+          line's text portion (after the ``↳`` glyph). Empty list if the
+          segment has no translation.
+
+        DOCX/PDF exporters use this to re-apply Bold/Italic/Underline
+        that the user toggled in the editor. TXT/JSON exports ignore it.
         """
-        runs_per_segment: list[list[FormattedRun]] = []
+        main_per_segment: list[list[FormattedRun]] = []
+        trans_per_segment: list[list[FormattedRun]] = []
         doc = self.text_edit.document()
+
+        # Walk blocks. Main lines produce an entry in both arrays (the
+        # translation entry stays empty unless a continuation block
+        # follows). Translation continuation blocks overwrite the last
+        # translation entry in-place.
         for i in range(doc.blockCount()):
             block = doc.findBlockByNumber(i)
             plain = block.text()
+
+            # Translation continuation? Attach to the previous segment.
+            trans_text = parse_translation(plain)
+            if trans_text is not None and main_per_segment:
+                runs = self._extract_runs_after_prefix(
+                    block, plain, TRANSLATION_PREFIX, trans_text,
+                )
+                trans_per_segment[-1] = runs
+                continue
+
             parsed = parse_line(plain)
             if parsed is None:
                 continue
-            _, _, _speaker, text = parsed
+            _, _, _speaker, _lang, text = parsed
             if not text:
-                runs_per_segment.append([])
+                main_per_segment.append([])
+                trans_per_segment.append([])
                 continue
 
             # Find where the text portion begins inside the block's plain
@@ -634,40 +927,64 @@ class CorrectionEditor(QWidget):
             # even if the timestamp/speaker contains the same string.
             text_start = plain.rfind(text)
             if text_start < 0:
-                runs_per_segment.append([FormattedRun(text=text)])
+                main_per_segment.append([FormattedRun(text=text)])
+                trans_per_segment.append([])
                 continue
-            text_end = text_start + len(text)
 
-            block_runs: list[FormattedRun] = []
-            it = block.begin()
-            block_pos = block.position()
-            while not it.atEnd():
-                fragment = it.fragment()
-                if fragment.isValid():
-                    frag_offset = fragment.position() - block_pos
-                    frag_text = fragment.text()
-                    frag_end = frag_offset + len(frag_text)
-                    overlap_start = max(frag_offset, text_start)
-                    overlap_end = min(frag_end, text_end)
-                    if overlap_start < overlap_end:
-                        sliced = frag_text[
-                            overlap_start - frag_offset : overlap_end - frag_offset
-                        ]
-                        fmt = fragment.charFormat()
-                        block_runs.append(
-                            FormattedRun(
-                                text=sliced,
-                                bold=fmt.fontWeight() >= QFont.Weight.Bold,
-                                italic=fmt.fontItalic(),
-                                underline=fmt.fontUnderline(),
-                            )
+            runs = self._extract_runs_in_range(
+                block, text_start, text_start + len(text),
+            )
+            main_per_segment.append(
+                _coalesce_runs(runs) if runs else [FormattedRun(text=text)]
+            )
+            trans_per_segment.append([])
+        return main_per_segment, trans_per_segment
+
+    def _extract_runs_after_prefix(
+        self, block, plain: str, prefix: str, body_text: str,
+    ) -> list[FormattedRun]:
+        """Extract B/I/U runs from the portion of *block* that comes
+        after *prefix*. Used for translation continuation lines whose
+        body starts at a fixed indent marker."""
+        text_start = plain.find(prefix)
+        if text_start < 0:
+            return [FormattedRun(text=body_text)]
+        text_start += len(prefix)
+        text_end = text_start + len(body_text)
+        runs = self._extract_runs_in_range(block, text_start, text_end)
+        return _coalesce_runs(runs) if runs else [FormattedRun(text=body_text)]
+
+    def _extract_runs_in_range(
+        self, block, text_start: int, text_end: int,
+    ) -> list[FormattedRun]:
+        """Walk the fragments of *block* and emit a FormattedRun for each
+        fragment that overlaps [text_start, text_end)."""
+        block_runs: list[FormattedRun] = []
+        it = block.begin()
+        block_pos = block.position()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                frag_offset = fragment.position() - block_pos
+                frag_text = fragment.text()
+                frag_end = frag_offset + len(frag_text)
+                overlap_start = max(frag_offset, text_start)
+                overlap_end = min(frag_end, text_end)
+                if overlap_start < overlap_end:
+                    sliced = frag_text[
+                        overlap_start - frag_offset : overlap_end - frag_offset
+                    ]
+                    fmt = fragment.charFormat()
+                    block_runs.append(
+                        FormattedRun(
+                            text=sliced,
+                            bold=fmt.fontWeight() >= QFont.Weight.Bold,
+                            italic=fmt.fontItalic(),
+                            underline=fmt.fontUnderline(),
                         )
-                it += 1
-            # Coalesce adjacent runs with identical formatting (keeps DOCX
-            # tidy when the user toggled formatting then turned it back off
-            # mid-typing).
-            runs_per_segment.append(_coalesce_runs(block_runs) if block_runs else [FormattedRun(text=text)])
-        return runs_per_segment
+                    )
+            it += 1
+        return block_runs
 
     # -- Volume --------------------------------------------------------------
 
@@ -747,6 +1064,55 @@ class CorrectionEditor(QWidget):
         self.btn_bold.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
         self.btn_italic.setChecked(fmt.fontItalic())
         self.btn_underline.setChecked(fmt.fontUnderline())
+
+    # -- Font picker ---------------------------------------------------------
+
+    def _on_font_family_changed(self, family: str) -> None:
+        """Change the base font family of the entire editor."""
+        self._editor_font_family = family
+        self._apply_editor_font()
+
+    def _on_font_size_changed(self, size: int) -> None:
+        """Change the base font size of the entire editor."""
+        self._editor_font_size = size
+        self._apply_editor_font()
+
+    def _apply_editor_font(self) -> None:
+        """Set the editor's document-wide font without destroying content.
+
+        ``setFont()`` on a QTextEdit only sets the default font for newly
+        typed text — existing text keeps whatever char format it already
+        has. To change *everything*, we walk the document and reset each
+        block's character format to the new font, preserving B/I/U that
+        the user may have applied. We also suppress the sync-to-model
+        callback so the segment list isn't rebuilt mid-operation.
+        """
+        new_font = QFont(self._editor_font_family, self._editor_font_size)
+        # Set the widget-level default (affects new typing + empty lines)
+        self.text_edit.setFont(new_font)
+
+        # Walk every block and update existing text to the new font/size,
+        # keeping any B/I/U the user toggled.
+        self._block_sync = True
+        doc = self.text_edit.document()
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.End,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        fmt = QTextCharFormat()
+        fmt.setFontFamilies([self._editor_font_family])
+        fmt.setFontPointSize(float(self._editor_font_size))
+        cursor.mergeCharFormat(fmt)
+        cursor.endEditBlock()
+        self._block_sync = False
+
+        # Refresh the playback highlight so its enlarged-text layer stays
+        # proportional to the new base size.
+        if self._segment_bg_selection is not None:
+            self._highlight_segment(self._current_seg_idx)
 
     # -- Find in transcript --------------------------------------------------
 
@@ -961,7 +1327,7 @@ class CorrectionEditor(QWidget):
         parsed = parse_line(block_text)
         if not parsed:
             return
-        start, end, _speaker, _text = parsed
+        start, end, _speaker, _lang, _text = parsed
 
         # Speaker click takes priority over timestamp click — the speaker
         # name sits *after* the timestamp, so the column ranges don't
@@ -1000,22 +1366,56 @@ class CorrectionEditor(QWidget):
         rendered transcript line, or ``None`` if no speaker is present.
 
         Range is inclusive of leading whitespace right after the closing
-        bracket — that gives the user a forgiving click target. The end
-        is the column of the colon (exclusive of the colon itself).
-        Mirrors the same 1..40 char heuristic that ``parse_line`` uses
-        so we don't false-trigger on text lines that happen to contain
-        a colon.
+        bracket, and stops at the start of any optional ``(XX)`` language
+        tag so clicking the tag doesn't open the speaker menu. Mirrors
+        the same 1..40 char heuristic that ``parse_line`` uses so we
+        don't false-trigger on text lines that happen to contain a colon.
         """
+        from transcript_format import LANG_TAG_RE
+
         ts_end = block_text.find("]")
         if ts_end < 0:
             return None
         colon_pos = block_text.find(":", ts_end + 1)
         if colon_pos < 0:
             return None
-        raw = block_text[ts_end + 1:colon_pos].strip()
-        if not (1 <= len(raw) <= 40):
+        raw = block_text[ts_end + 1:colon_pos]
+        stripped = raw.strip()
+        # Peel off trailing "(XX)" tag so the click range stops at the
+        # end of the speaker name itself.
+        tag_match = LANG_TAG_RE.search(stripped)
+        if tag_match:
+            stripped = stripped[: tag_match.start()].strip()
+        if not (1 <= len(stripped) <= 40):
             return None
-        return (ts_end + 1, colon_pos)
+        # Find where the name ends inside the original (un-stripped) raw
+        # substring so we return column positions relative to the block.
+        name_end_in_raw = raw.rfind(stripped) + len(stripped)
+        return (ts_end + 1, ts_end + 1 + name_end_in_raw)
+
+    # -- Video rotation ------------------------------------------------------
+
+    def _rotate_video(self, direction: str) -> None:
+        """Rotate the video 90° in the given direction and log it."""
+        if not hasattr(self, "_video_view"):
+            return
+        if direction == "cw":
+            self._video_view.rotate_cw()
+        else:
+            self._video_view.rotate_ccw()
+        deg = self._video_view.rotation_degrees
+        self.doc.log("Video rotated", f"{deg}° (user adjusted)")
+
+    def _zoom_video(self, action: str) -> None:
+        """Zoom the video in, out, or reset."""
+        if not hasattr(self, "_video_view"):
+            return
+        if action == "in":
+            self._video_view.zoom_in()
+        elif action == "out":
+            self._video_view.zoom_out()
+        else:
+            self._video_view.zoom_reset()
 
     # -- Playback callbacks --------------------------------------------------
 
@@ -1067,7 +1467,7 @@ class CorrectionEditor(QWidget):
             block = doc.findBlockByNumber(i)
             parsed = parse_line(block.text())
             if parsed:
-                start, end, _, _ = parsed
+                start, end, _, _, _ = parsed
                 if start <= seconds <= end:
                     return i
                 # Also track the closest preceding segment
@@ -1078,31 +1478,45 @@ class CorrectionEditor(QWidget):
     # -- Highlight current segment -------------------------------------------
 
     def _highlight_segment(self, idx: int) -> None:
-        """Highlight the currently-playing segment using an ExtraSelection.
+        """Highlight the currently-playing segment using a single
+        ExtraSelection that combines a full-width background bar with
+        enlarged, brightened text.
 
-        This is purely visual — it does NOT modify the document, so it
-        doesn't pollute the undo stack. (The previous implementation used
-        cursor.setBlockFormat() which counted as a document edit and made
-        Ctrl+Z undo the highlight instead of the user's typing.)
+        Uses ONE ExtraSelection (not two stacked layers) to avoid
+        rendering issues where a character-range selection can mask the
+        background of a full-width selection underneath on some PySide6
+        builds. FullWidthSelection extends the background colour across
+        the full editor width while the character formatting (font size,
+        weight, foreground) applies only to the selected text range.
+
+        Purely visual — does NOT modify the document, so it doesn't
+        pollute the undo stack.
         """
-        if 0 <= idx < self.text_edit.blockCount():
+        if 0 <= idx < self.text_edit.document().blockCount():
             block = self.text_edit.document().findBlockByNumber(idx)
-            sel = QTextEdit.ExtraSelection()
-            sel.cursor = QTextCursor(block)
-            sel.format = QTextCharFormat()
-            sel.format.setBackground(self._current_highlight_color())
-            # Spans the full line width regardless of cursor position
-            sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
-            self._segment_selection = sel
-            # Auto-scroll to keep the playhead line visible — but only if
-            # the user isn't actively editing, so we don't yank their cursor
-            # mid-keystroke.
+
+            # Layer 1: full-width background bar (no text selection —
+            # FullWidthSelection only works with a positioned cursor,
+            # NOT a character-range selection).
+            bg = QTextEdit.ExtraSelection()
+            bg.cursor = QTextCursor(block)
+            bg.format = QTextCharFormat()
+            bg.format.setBackground(self._current_highlight_color())
+            bg.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            self._segment_bg_selection = bg
+
+            self._segment_text_selection = None
+
+            # Auto-scroll to keep the playhead line visible — but only
+            # if the user isn't actively editing, so we don't yank their
+            # cursor mid-keystroke.
             if not self.text_edit.hasFocus():
                 self._scroll_to_block(idx)
             # Kick off the flash animation
             self._start_highlight_flash()
         else:
-            self._segment_selection = None
+            self._segment_bg_selection = None
+            self._segment_text_selection = None
 
         self._refresh_extra_selections()
 
@@ -1112,8 +1526,8 @@ class CorrectionEditor(QWidget):
         """Interpolate between the bright flash color and the steady
         ``SEGMENT_HIGHLIGHT`` based on the current intensity (0..1)."""
         steady = QColor(SEGMENT_HIGHLIGHT)
-        # Flash color: brighter, slightly more saturated version of accent
-        flash = QColor("#5A2A6E")
+        # Flash color: vivid purple burst, clearly visible even at a glance.
+        flash = QColor("#7040A0")
         t = max(0.0, min(1.0, self._highlight_intensity))
         return QColor(
             int(steady.red() + t * (flash.red() - steady.red())),
@@ -1126,9 +1540,9 @@ class CorrectionEditor(QWidget):
 
     def _set_highlight_intensity(self, value: float) -> None:
         self._highlight_intensity = value
-        # Re-color the existing selection without rebuilding it
-        if self._segment_selection is not None:
-            self._segment_selection.format.setBackground(self._current_highlight_color())
+        # Re-color the existing background selection without rebuilding it
+        if self._segment_bg_selection is not None:
+            self._segment_bg_selection.format.setBackground(self._current_highlight_color())
             self._refresh_extra_selections()
 
     highlight_intensity = Property(float, _get_highlight_intensity, _set_highlight_intensity)
@@ -1137,7 +1551,7 @@ class CorrectionEditor(QWidget):
         """Animate the highlight from peak (1.0) down to steady (0.0)."""
         if not hasattr(self, "_highlight_anim"):
             self._highlight_anim = QPropertyAnimation(self, b"highlight_intensity", self)
-            self._highlight_anim.setDuration(280)
+            self._highlight_anim.setDuration(400)
             self._highlight_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
         self._highlight_anim.stop()
         self._highlight_anim.setStartValue(1.0)
@@ -1171,9 +1585,11 @@ class CorrectionEditor(QWidget):
         selections: list[QTextEdit.ExtraSelection] = []
         # 1. Flag highlights — one per flagged segment
         selections.extend(self._build_flag_selections())
-        # 2. Currently-playing segment
-        if self._segment_selection is not None:
-            selections.append(self._segment_selection)
+        # 2. Currently-playing segment (background bar + enlarged text)
+        if self._segment_bg_selection is not None:
+            selections.append(self._segment_bg_selection)
+        if self._segment_text_selection is not None:
+            selections.append(self._segment_text_selection)
         # 3. Search matches
         if self._search_query and self._search_matches:
             all_match_fmt = QTextCharFormat()
@@ -1202,7 +1618,7 @@ class CorrectionEditor(QWidget):
         for i in range(doc.blockCount()):
             parsed = parse_line(doc.findBlockByNumber(i).text())
             if parsed:
-                start, end, _, _ = parsed
+                start, end, _, _, _ = parsed
                 seg_to_block[(start, end)] = i
         for seg in self.doc.segments:
             if not seg.flag:
@@ -1224,11 +1640,25 @@ class CorrectionEditor(QWidget):
         return sels
 
     def _segment_at_cursor(self, cursor: QTextCursor):
-        """Return the Segment object at the given cursor's block, or None."""
-        parsed = parse_line(cursor.block().text())
+        """Return the Segment object at the given cursor's block, or None.
+
+        Also resolves translation continuation blocks: if the cursor is
+        on an indented ``↳`` line, we walk back to the preceding main
+        line so the right-click menu still targets the right segment.
+        """
+        block = cursor.block()
+        plain = block.text()
+        # Translation continuation? Walk back to the main line.
+        if parse_translation(plain) is not None:
+            prev = block.previous()
+            while prev.isValid() and parse_translation(prev.text()) is not None:
+                prev = prev.previous()
+            if prev.isValid():
+                plain = prev.text()
+        parsed = parse_line(plain)
         if not parsed:
             return None
-        start, end, _, _ = parsed
+        start, end, _, _, _ = parsed
         for seg in self.doc.segments:
             if seg.start == start and seg.end == end:
                 return seg
@@ -1253,6 +1683,39 @@ class CorrectionEditor(QWidget):
             )
             self._populate_speaker_menu(speaker_menu, seg)
 
+            # Language / translation submenu. We offer the common choices
+            # inline and an "Other…" item for any ISO code Whisper
+            # supports. Re-transcription runs the audio slice through
+            # Whisper again with the chosen language forced — see
+            # transcriber.SegmentRetranscribeWorker.
+            current_lang = seg.language.upper() if seg.language else "EN"
+            retrans_menu = menu.addMenu(
+                f"Re-transcribe as  (current: {current_lang})"
+            )
+            for display, code in (("English", ""), ("Spanish", "es"), ("Other…", "__other__")):
+                act = QAction(display, retrans_menu)
+                act.triggered.connect(
+                    lambda _=False, s=seg, c=code: self._retranscribe_segment(s, c)
+                )
+                retrans_menu.addAction(act)
+
+            trans_label = (
+                f"Edit translation ({len(seg.translation)} chars)..."
+                if seg.translation else "Add translation..."
+            )
+            trans_act = QAction(trans_label, menu)
+            trans_act.triggered.connect(lambda _=False, s=seg: self._edit_translation(s))
+            menu.addAction(trans_act)
+
+            if seg.language:
+                clear_lang_act = QAction("Clear language tag (mark as default)", menu)
+                clear_lang_act.triggered.connect(
+                    lambda _=False, s=seg: self._set_language(s, "")
+                )
+                menu.addAction(clear_lang_act)
+
+            menu.addSeparator()
+
             flag_menu = menu.addMenu("Flag segment as...")
             for kind in ("inaudible", "admission", "contradiction", "follow_up", "custom"):
                 label, _bg, accent = FLAG_DISPLAY[kind]
@@ -1276,6 +1739,105 @@ class CorrectionEditor(QWidget):
                 menu.addAction(clear_act)
 
         menu.exec(self.text_edit.viewport().mapToGlobal(pos))
+
+    # -- Language / translation handlers ------------------------------------
+
+    def _edit_translation(self, segment) -> None:
+        """Prompt the user for the translation of a segment.
+
+        We always sync from the editor first in case the user typed
+        something in the translation line and hasn't tabbed away yet.
+        """
+        self._sync_text_to_model()
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Translation",
+            f"Translation for segment at {fmt_timestamp(segment.start)}"
+            + (f" ({segment.language.upper()})" if segment.language else "")
+            + ":",
+            segment.translation,
+        )
+        if not ok:
+            return
+        segment.translation = text.strip()
+        self._replace_block_for_segment(segment)
+        self.doc.log(
+            "Translation edited",
+            f"@ {fmt_timestamp(segment.start)} ({len(segment.translation)} chars)",
+        )
+
+    def _set_language(self, segment, language: str) -> None:
+        """Update a segment's language tag without re-transcribing."""
+        prev = segment.language or "(default)"
+        new = language or "(default)"
+        if prev == new:
+            return
+        segment.language = language
+        self._replace_block_for_segment(segment)
+        self.doc.log(
+            "Language tag changed",
+            f"@ {fmt_timestamp(segment.start)}: {prev} → {new}",
+        )
+
+    def _retranscribe_segment(self, segment, language_code: str) -> None:
+        """Re-transcribe *segment*'s audio slice with the given language
+        forced. ``language_code`` is a lowercase ISO code, or "" for the
+        document's default language, or "__other__" to prompt.
+        """
+        if language_code == "__other__":
+            code, ok = QInputDialog.getText(
+                self, "Re-transcribe segment",
+                "ISO language code (e.g. fr, de, zh):",
+                text="",
+            )
+            if not ok:
+                return
+            language_code = code.strip().lower()
+            if not language_code:
+                return
+
+        if not self.doc.audio_path or not Path(self.doc.audio_path).exists():
+            return  # source audio is missing; nothing to re-run
+
+        # Flush editor text so segment.text is current before we overwrite
+        # it with the re-transcription result.
+        self._sync_text_to_model()
+
+        from transcriber import SegmentRetranscribeWorker
+        worker = SegmentRetranscribeWorker(
+            audio_path=str(self.doc.audio_path),
+            start=segment.start,
+            end=segment.end,
+            language=language_code or "en",  # empty → default (English)
+            model_size=self.doc.model_size,
+            parent=self,
+        )
+        # Keep a reference so the QThread isn't GC'd mid-run
+        self._retrans_worker = worker
+        worker.finished_text.connect(
+            lambda new_text, s=segment, lc=language_code: self._on_retranscribe_done(
+                s, lc, new_text
+            )
+        )
+        worker.failed.connect(self._on_retranscribe_failed)
+        worker.start()
+
+    def _on_retranscribe_done(self, segment, language_code: str, new_text: str) -> None:
+        prev_text = segment.text
+        prev_lang = segment.language or "(default)"
+        segment.text = new_text.strip() or segment.text
+        segment.language = language_code  # "" means default
+        self._replace_block_for_segment(segment)
+        self.doc.log(
+            "Segment re-transcribed",
+            f"@ {fmt_timestamp(segment.start)}: lang {prev_lang} → "
+            f"{segment.language or '(default)'}; "
+            f"{len(prev_text)} → {len(segment.text)} chars",
+        )
+
+    def _on_retranscribe_failed(self, msg: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, "Re-transcription failed", msg)
 
     def _set_flag(self, segment, kind: str, clear_note: bool = False) -> None:
         """Set or clear a segment's flag, log it, and refresh visuals."""
@@ -1454,9 +2016,13 @@ class CorrectionEditor(QWidget):
         )
 
     def _replace_block_for_segment(self, segment) -> None:
-        """Rewrite the block whose timestamps match *segment* with a fresh
-        format_line() output. Preserves cursor position and undo for other
-        blocks (only this block goes onto the undo stack)."""
+        """Rewrite the block(s) whose timestamps match *segment* with
+        fresh format_segment() output. Handles segments that span two
+        blocks (main + translation continuation) by replacing the range
+        from the start of the main block through the end of the
+        continuation block, if present. Preserves cursor position and
+        undo for unrelated blocks.
+        """
         doc = self.text_edit.document()
         for i in range(doc.blockCount()):
             block = doc.findBlockByNumber(i)
@@ -1464,17 +2030,27 @@ class CorrectionEditor(QWidget):
             if not parsed:
                 continue
             if parsed[0] == segment.start and parsed[1] == segment.end:
-                new_text = format_line(
+                new_text = format_segment(
                     segment.start, segment.end, segment.text, segment.speaker,
+                    language=segment.language, translation=segment.translation,
                 )
+                # Determine the ending block — if the next block is this
+                # segment's existing translation continuation, include it
+                # in the replacement so we don't leave a stale line behind.
+                end_block = block
+                next_block = block.next()
+                if next_block.isValid() and parse_translation(next_block.text()) is not None:
+                    end_block = next_block
+
                 # Suppress sync — we already updated the model directly.
                 # Otherwise textChanged would round-trip and rebuild.
                 self._block_sync = True
                 cursor = QTextCursor(block)
                 cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-                cursor.movePosition(
-                    QTextCursor.MoveOperation.EndOfBlock,
-                    QTextCursor.MoveMode.KeepAnchor,
+                end_cursor = QTextCursor(end_block)
+                end_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+                cursor.setPosition(
+                    end_cursor.position(), QTextCursor.MoveMode.KeepAnchor,
                 )
                 cursor.insertText(new_text)
                 self._block_sync = False

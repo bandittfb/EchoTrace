@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -44,7 +45,28 @@ AUDIO_EXTS = {
     # Video (must stay in sync with VIDEO_EXTS in editor.py and README.md)
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v",
 }
-MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
+# Model dropdown choices: (display label, whisper model name).
+# Friendly labels help non-technical users understand the trade-off.
+MODEL_CHOICES: list[tuple[str, str]] = [
+    ("Tiny — fastest, least accurate",      "tiny"),
+    ("Base — recommended",                  "base"),
+    ("Small — balanced",                    "small"),
+    ("Medium — slower, high accuracy",      "medium"),
+    ("Large — slowest, best accuracy",      "large-v3"),
+]
+# Legacy list kept for any code that still references it.
+MODEL_SIZES = [v for _, v in MODEL_CHOICES]
+
+# Language dropdown choices: (display label, value passed to the worker).
+# None  -> auto-detect (Whisper picks one language for the whole file)
+# "multi" -> run the multilingual pipeline (per-segment language detection)
+# "en", "es", ... -> force that language for the whole file
+LANGUAGE_CHOICES: list[tuple[str, object]] = [
+    ("English", "en"),
+    ("Spanish", "es"),
+    ("Multilingual (EN + ES)", "multi"),
+    ("Auto-detect", None),
+]
 LOGO_PATH = Path(__file__).parent / "logo.png"
 
 
@@ -108,6 +130,140 @@ class DropZone(QLabel):
                 "Audio: MP3, WAV, M4A, FLAC, OGG, WMA, AAC\n"
                 "Video: MP4, MKV, WebM, AVI, MOV, WMV, FLV, M4V",
             )
+
+
+class TranscribeSettingsDialog(QDialog):
+    """Pre-transcription confirmation dialog.
+
+    Pops up after the user selects a file (browse or drag-and-drop),
+    showing the file name and all transcription settings in one place.
+    The user reviews or adjusts settings, then clicks Transcribe to
+    proceed. This eliminates the "I didn't know I could pick a model"
+    problem by making the choice impossible to miss.
+    """
+
+    def __init__(
+        self,
+        file_path: str,
+        model_index: int = 1,
+        lang_index: int = 0,
+        diarize: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Ready to Transcribe")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 16)
+
+        # File name
+        file_label = QLabel(f"<b>{Path(file_path).name}</b>")
+        file_label.setStyleSheet("font-size: 14px;")
+        file_label.setWordWrap(True)
+        layout.addWidget(file_label)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #2A2A4A;")
+        layout.addWidget(sep)
+
+        # Settings grid
+        settings = QVBoxLayout()
+        settings.setSpacing(8)
+
+        # Model
+        model_row = QHBoxLayout()
+        model_lbl = QLabel("Model:")
+        model_lbl.setFixedWidth(80)
+        model_lbl.setStyleSheet("font-weight: bold;")
+        model_row.addWidget(model_lbl)
+        self.combo_model = QComboBox()
+        for display, value in MODEL_CHOICES:
+            self.combo_model.addItem(display, userData=value)
+        self.combo_model.setCurrentIndex(model_index)
+        model_row.addWidget(self.combo_model, 1)
+        settings.addLayout(model_row)
+
+        # Language
+        lang_row = QHBoxLayout()
+        lang_lbl = QLabel("Language:")
+        lang_lbl.setFixedWidth(80)
+        lang_lbl.setStyleSheet("font-weight: bold;")
+        lang_row.addWidget(lang_lbl)
+        self.combo_lang = QComboBox()
+        for display, value in LANGUAGE_CHOICES:
+            self.combo_lang.addItem(display, userData=value)
+        self.combo_lang.setCurrentIndex(lang_index)
+        lang_row.addWidget(self.combo_lang, 1)
+        settings.addLayout(lang_row)
+
+        # Speaker detection
+        spk_row = QHBoxLayout()
+        spk_lbl = QLabel("Speakers:")
+        spk_lbl.setFixedWidth(80)
+        spk_lbl.setStyleSheet("font-weight: bold;")
+        spk_row.addWidget(spk_lbl)
+        self.btn_diarize = QPushButton(
+            f"Speaker Detection: {'ON' if diarize else 'OFF'}"
+        )
+        self.btn_diarize.setCheckable(True)
+        self.btn_diarize.setChecked(diarize)
+        self.btn_diarize.clicked.connect(
+            lambda: self.btn_diarize.setText(
+                f"Speaker Detection: {'ON' if self.btn_diarize.isChecked() else 'OFF'}"
+            )
+        )
+        spk_row.addWidget(self.btn_diarize, 1)
+        settings.addLayout(spk_row)
+
+        layout.addLayout(settings)
+
+        # Hint
+        hint = QLabel(
+            "Larger models produce more accurate transcriptions but take longer. "
+            "Base is a good starting point for most files."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8892A0; font-size: 11px; font-style: italic; padding: 4px 0;")
+        layout.addWidget(hint)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedHeight(32)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        transcribe_btn = QPushButton("Transcribe")
+        transcribe_btn.setObjectName("primaryBtn")
+        transcribe_btn.setFixedHeight(32)
+        transcribe_btn.setDefault(True)
+        transcribe_btn.clicked.connect(self.accept)
+        btn_row.addWidget(transcribe_btn)
+
+        layout.addLayout(btn_row)
+
+    # -- Public accessors for the chosen settings ----------------------------
+
+    def selected_model(self) -> str:
+        return self.combo_model.currentData()
+
+    def selected_model_index(self) -> int:
+        return self.combo_model.currentIndex()
+
+    def selected_language(self):
+        return self.combo_lang.currentData()
+
+    def selected_language_index(self) -> int:
+        return self.combo_lang.currentIndex()
+
+    def selected_diarize(self) -> bool:
+        return self.btn_diarize.isChecked()
 
 
 class MainWindow(QMainWindow):
@@ -179,7 +335,7 @@ class MainWindow(QMainWindow):
 
         # Drop zone
         self.drop_zone = DropZone()
-        self.drop_zone.on_files(self._start_transcription)
+        self.drop_zone.on_files(self._confirm_and_transcribe)
         layout.addWidget(self.drop_zone, 1)
 
         layout.addSpacing(8)
@@ -198,15 +354,44 @@ class MainWindow(QMainWindow):
         self.btn_open_project.clicked.connect(self._open_project)
         controls.addWidget(self.btn_open_project)
 
+        self.btn_batch = QPushButton("Batch Process...")
+        self.btn_batch.setFixedWidth(130)
+        self.btn_batch.setToolTip("Transcribe multiple files at once and auto-export results")
+        self.btn_batch.clicked.connect(self._open_batch)
+        controls.addWidget(self.btn_batch)
+
         model_label = QLabel("Model:")
         model_label.setFixedWidth(45)
         controls.addWidget(model_label)
 
         self.combo_model = QComboBox()
-        self.combo_model.addItems(MODEL_SIZES)
-        self.combo_model.setCurrentText("base")
-        self.combo_model.setFixedWidth(110)
+        for display, value in MODEL_CHOICES:
+            self.combo_model.addItem(display, userData=value)
+        self.combo_model.setCurrentIndex(1)  # "Base — recommended"
+        self.combo_model.setFixedWidth(250)
+        self.combo_model.setToolTip(
+            "Larger models produce more accurate transcriptions but take longer.\n"
+            "Base is a good starting point for most files."
+        )
         controls.addWidget(self.combo_model)
+
+        lang_label = QLabel("Language:")
+        lang_label.setFixedWidth(68)
+        controls.addWidget(lang_label)
+
+        self.combo_lang = QComboBox()
+        for display, value in LANGUAGE_CHOICES:
+            # userData carries the value; display text is what the user sees.
+            # Using userData lets us store None for "auto-detect" cleanly.
+            self.combo_lang.addItem(display, userData=value)
+        self.combo_lang.setCurrentIndex(0)  # English
+        self.combo_lang.setFixedWidth(180)
+        self.combo_lang.setToolTip(
+            "English/Spanish: force that language (most accurate).\n"
+            "Multilingual: detect per segment — slower but handles mixed audio.\n"
+            "Auto-detect: let Whisper pick one language for the whole file."
+        )
+        controls.addWidget(self.combo_lang)
 
         controls.addStretch()
 
@@ -244,13 +429,18 @@ class MainWindow(QMainWindow):
 
     # -- Phase 1 actions -----------------------------------------------------
 
+    def _open_batch(self) -> None:
+        from batch_dialog import BatchDialog
+        dlg = BatchDialog(parent=self)
+        dlg.exec()
+
     def _browse(self) -> None:
         ext_str = " ".join(f"*{e}" for e in AUDIO_EXTS)
         path, _ = QFileDialog.getOpenFileName(
             self, "Select audio or video file", "", f"Audio/Video ({ext_str});;All (*.*)"
         )
         if path:
-            self._start_transcription(path)
+            self._confirm_and_transcribe(path)
 
     def _open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -455,15 +645,49 @@ class MainWindow(QMainWindow):
         # Refresh the view in-place
         view.append(f"[{entry.ts}]  {entry.action}  —  {entry.details}")
 
+    def _confirm_and_transcribe(self, path: str) -> None:
+        """Show the pre-transcription settings dialog, then start if confirmed.
+
+        The dialog mirrors the main window's Model / Language / Speaker
+        controls so the user can review or adjust settings in context.
+        On accept, the main window controls are synced to whatever the
+        user chose in the dialog (so the next file inherits those prefs).
+        """
+        dlg = TranscribeSettingsDialog(
+            file_path=path,
+            model_index=self.combo_model.currentIndex(),
+            lang_index=self.combo_lang.currentIndex(),
+            diarize=self.btn_diarize.isChecked(),
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Sync the dialog's choices back to the main window controls
+        # so the next file inherits whatever the user just picked.
+        self.combo_model.setCurrentIndex(dlg.selected_model_index())
+        self.combo_lang.setCurrentIndex(dlg.selected_language_index())
+        self.btn_diarize.setChecked(dlg.selected_diarize())
+        self.btn_diarize.setText(
+            f"Speaker Detection: {'ON' if dlg.selected_diarize() else 'OFF'}"
+        )
+
+        self._start_transcription(path)
+
     def _start_transcription(self, path: str) -> None:
         self._segment_count = 0
         self._waiting.start()
         self._stack.setCurrentWidget(self._waiting)
 
         self._audio_path = path
+        # Remember the user's language pick so _on_finished can record
+        # whether it was forced (explicit) or left to auto-detect, which
+        # matters for chain-of-custody.
+        self._selected_language = self.combo_lang.currentData()
         self._worker = TranscriberWorker(
             audio_path=path,
-            model_size=self.combo_model.currentText(),
+            model_size=self.combo_model.currentData(),
+            language=self._selected_language,
             enable_diarization=self.btn_diarize.isChecked(),
             parent=self,
         )
@@ -488,16 +712,30 @@ class MainWindow(QMainWindow):
         self._doc = TranscriptDocument(
             segments=segments,
             audio_path=Path(self._audio_path),
-            model_size=self.combo_model.currentText(),
+            model_size=self.combo_model.currentData(),
             language=lang,
             language_probability=lang_prob,
             created_at=datetime.now().isoformat(),
         )
         diar = " + diarization" if self.btn_diarize.isChecked() else ""
+        # Describe the language choice so the audit log reflects WHY the
+        # transcript ended up in whichever language(s) it did. This is
+        # the "chain-of-custody" bit — a reader of the audit log can tell
+        # whether the investigator declared the language or the model
+        # guessed it.
+        sel = getattr(self, "_selected_language", None)
+        if sel == "multi":
+            lang_desc = "multilingual (per-segment detection)"
+            tagged = sum(1 for s in segments if s.language)
+            lang_desc += f", {tagged} non-default-language segments tagged"
+        elif sel is None:
+            lang_desc = f"auto-detected={lang or 'unknown'} ({lang_prob:.2f})"
+        else:
+            lang_desc = f"user-selected={sel}"
         self._doc.log(
             "Transcription completed",
-            f"model={self.combo_model.currentText()}{diar}, "
-            f"segments={len(segments)}, language={lang or 'unknown'}",
+            f"model={self.combo_model.currentData()}{diar}, "
+            f"segments={len(segments)}, language={lang_desc}",
         )
         self._open_editor()
 
@@ -664,8 +902,12 @@ class MainWindow(QMainWindow):
             try:
                 # Only DOCX/PDF carry rich formatting; TXT/JSON ignore it.
                 if capture_formatting and self._editor:
-                    rich_runs = self._editor.extract_rich_runs()
-                    exporter(self._doc, Path(path), rich_runs=rich_runs)
+                    rich_runs, translation_runs = self._editor.extract_rich_runs()
+                    exporter(
+                        self._doc, Path(path),
+                        rich_runs=rich_runs,
+                        translation_runs=translation_runs,
+                    )
                 else:
                     exporter(self._doc, Path(path))
                 self._doc.log(f"Exported {suffix.lstrip('.').upper()}", path)
@@ -702,7 +944,7 @@ class MainWindow(QMainWindow):
             p = url.toLocalFile()
             if Path(p).suffix.lower() in AUDIO_EXTS:
                 if self._stack.currentIndex() == 0:
-                    self._start_transcription(p)
+                    self._confirm_and_transcribe(p)
                 return
 
 

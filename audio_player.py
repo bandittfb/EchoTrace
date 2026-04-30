@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem, QVideoWidget
 
 
 class AudioPlayer(QObject):
@@ -28,10 +28,10 @@ class AudioPlayer(QObject):
 
     # -- public API ----------------------------------------------------------
 
-    def set_video_output(self, widget: QVideoWidget) -> None:
-        """Attach a QVideoWidget for video rendering."""
-        self._video_widget = widget
-        self._player.setVideoOutput(widget)
+    def set_video_output(self, output) -> None:
+        """Attach a video output — accepts QVideoWidget or QGraphicsVideoItem."""
+        self._video_widget = output
+        self._player.setVideoOutput(output)
 
     def load(self, path: str) -> None:
         self._player.setSource(QUrl.fromLocalFile(path))

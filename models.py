@@ -18,10 +18,21 @@ FLAG_KINDS = ("inaudible", "admission", "contradiction", "follow_up", "custom")
 class Segment:
     start: float  # seconds
     end: float    # seconds
-    text: str     # editable transcript text
+    text: str     # editable transcript text (in the language spoken)
     speaker: str = ""  # e.g. "Speaker 1", "Speaker 2"
     flag: str = ""  # one of FLAG_KINDS or "" for no flag
     note: str = ""  # optional free-form note attached to this segment
+    # Language tag for mixed-language transcripts. Empty string means the
+    # segment is in the document's default language (currently English) —
+    # such segments render WITHOUT a "(XX)" tag to keep the common case
+    # visually clean. Any non-empty value is a lowercase ISO-639-1 code
+    # like "es", "fr", "zh", and is displayed uppercase in the editor.
+    language: str = ""
+    # Optional hand-written translation of ``text`` into the default
+    # language. Never auto-populated — only the investigator fills this in.
+    # Rich B/I/U formatting is captured at export time (same model as the
+    # main ``text`` field), so this stays plain text on disk.
+    translation: str = ""
 
 
 @dataclass

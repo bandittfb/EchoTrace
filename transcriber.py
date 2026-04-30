@@ -1,4 +1,19 @@
-"""Background worker that runs faster-whisper transcription + pyannote diarization."""
+"""Background worker that runs faster-whisper transcription + pyannote diarization.
+
+The language parameter controls how Whisper is invoked:
+
+* ``"en"`` / ``"es"`` / any ISO code — force that language for the whole
+  file. Fastest and most accurate when you know the language up front.
+* ``None`` — let Whisper detect the language once at the start. Classic
+  Whisper behaviour; prone to mis-detection on short or noisy audio.
+* ``"multi"`` — per-segment language detection. First transcribes with
+  the primary (default) language forced, then on the second pass checks
+  each segment's audio against Whisper's language detector; segments
+  that came back as a different language get re-transcribed individually
+  with that language forced. This is the mode that produces faithful
+  mixed-language transcripts (e.g. an English-speaking officer and a
+  Spanish-speaking witness in the same recording).
+"""
 from __future__ import annotations
 
 import os
@@ -7,6 +22,12 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from models import Segment
+
+# Document-level default language. Segments whose language matches this
+# render in the editor WITHOUT a "(XX)" tag — it's the baseline everyone
+# expects. Kept as a module constant so it's trivial to change later if
+# we ever expose "default language" as a per-project setting.
+DEFAULT_LANGUAGE = "en"
 
 
 def _find_ffmpeg() -> str:
@@ -146,7 +167,10 @@ class TranscriberWorker(QThread):
 
     def run(self) -> None:
         try:
-            segments = self._transcribe()
+            if self.language == "multi":
+                segments = self._transcribe_multilingual()
+            else:
+                segments = self._transcribe()
             if self.enable_diarization:
                 self._diarize(segments)
             self.progress.emit(100, "Done.")
@@ -175,13 +199,128 @@ class TranscriberWorker(QThread):
             getattr(info, "language_probability", 0.0) or 0.0
         )
 
+        # Tag segments whose language differs from the document default —
+        # that way, if the user picked "Spanish" up front, every segment
+        # renders with an "(ES)" tag, and the exports reflect that too.
+        tag = (
+            self.detected_language if self.detected_language
+            and self.detected_language != DEFAULT_LANGUAGE else ""
+        )
+
         result: list[Segment] = []
         for seg in segments_gen:
-            result.append(Segment(start=seg.start, end=seg.end, text=seg.text.strip()))
+            result.append(Segment(
+                start=seg.start, end=seg.end,
+                text=seg.text.strip(), language=tag,
+            ))
             pct = min(69, int(seg.end / duration * 70))  # 0-70% for transcription
             self.progress.emit(pct, f"Transcribing... {pct}%")
 
         return result
+
+    def _transcribe_multilingual(self) -> list[Segment]:
+        """Three-pass multilingual pipeline.
+
+        1. Transcribe the full file with the default language forced
+           (English). Whisper's VAD gives us well-segmented chunks with
+           accurate timestamps for the default-language portions.
+        2. For each segment, extract its audio slice and run Whisper's
+           own detect_language() on it. Cheap — no decoding, just the
+           encoder pass and a softmax over the language tokens.
+        3. Segments whose detected language differs from the default
+           (with sufficient confidence) are re-transcribed individually
+           with the detected language forced. Everything else is kept
+           from pass 1.
+
+        The final list carries a non-empty ``Segment.language`` only for
+        segments whose language differs from the document default, so
+        the editor can show ``(ES)`` tags only where they actually matter.
+        """
+        from faster_whisper import WhisperModel
+        from faster_whisper.audio import decode_audio
+
+        primary = DEFAULT_LANGUAGE
+        self.progress.emit(0, f"Loading transcription model '{self.model_size}'...")
+        model = WhisperModel(self.model_size, device="auto", compute_type="auto")
+
+        # --- Pass 1: full transcription in primary language -----------------
+        self.progress.emit(5, f"Transcribing pass 1 ({primary.upper()})...")
+        segments_gen, info = model.transcribe(
+            self.audio_path, beam_size=5, vad_filter=True, language=primary,
+        )
+        duration = info.duration or 1.0
+        pass1: list[Segment] = []
+        for seg in segments_gen:
+            pass1.append(Segment(
+                start=seg.start, end=seg.end, text=seg.text.strip(),
+            ))
+            pct = min(49, int(seg.end / duration * 50))
+            self.progress.emit(pct, f"Transcribing pass 1... {pct}%")
+
+        # Record the language metadata for the document, using the
+        # detected primary (should equal the forced language).
+        self.detected_language = getattr(info, "language", primary) or primary
+        self.detected_language_probability = float(
+            getattr(info, "language_probability", 1.0) or 1.0
+        )
+
+        # --- Pass 2 & 3: per-segment language audit + selective re-run ------
+        self.progress.emit(55, "Loading audio for language audit...")
+        try:
+            audio = decode_audio(self.audio_path, sampling_rate=16000)
+        except Exception:
+            # If audio decode fails, bail out gracefully — return pass 1
+            # results as-is rather than losing the whole transcript.
+            return pass1
+
+        total = max(1, len(pass1))
+        for i, seg in enumerate(pass1):
+            s_i = int(seg.start * 16000)
+            e_i = int(seg.end * 16000)
+            # Skip very short chunks — language detection is unreliable
+            # below ~0.5s and such segments are usually interjections
+            # ("um", "sí") anyway. Leave them tagged with the default.
+            if e_i - s_i < 8000:  # < 0.5 s at 16 kHz
+                continue
+
+            chunk = audio[s_i:e_i]
+            try:
+                det = model.detect_language(chunk)
+            except Exception:
+                det = None
+
+            # faster-whisper's detect_language return shape has varied
+            # across versions — handle both the tuple and the object forms.
+            detected_lang, det_prob = primary, 0.0
+            if det is not None:
+                if hasattr(det, "language"):
+                    detected_lang = det.language or primary
+                    det_prob = float(getattr(det, "language_probability", 0.0) or 0.0)
+                elif isinstance(det, tuple) and len(det) >= 2:
+                    detected_lang = det[0] or primary
+                    det_prob = float(det[1] or 0.0)
+
+            # Confidence threshold: we only rewrite the pass-1 text if
+            # language detection is reasonably sure it's different. 0.5
+            # is empirical — below that, mis-detection on short or noisy
+            # chunks becomes the dominant error.
+            if detected_lang != primary and det_prob >= 0.5:
+                try:
+                    new_segs, _ = model.transcribe(
+                        chunk, beam_size=5, vad_filter=False,
+                        language=detected_lang,
+                    )
+                    new_text = " ".join(s.text.strip() for s in new_segs).strip()
+                except Exception:
+                    new_text = ""
+                if new_text:
+                    seg.text = new_text
+                    seg.language = detected_lang
+
+            pct = 55 + min(40, int(i / total * 40))
+            self.progress.emit(pct, f"Language audit... segment {i+1}/{total}")
+
+        return pass1
 
     def _diarize(self, segments: list[Segment]) -> None:
         token = _load_hf_token()
@@ -219,3 +358,66 @@ class TranscriberWorker(QThread):
 
         self.progress.emit(95, "Assigning speaker labels...")
         _assign_speakers(segments, diarization)
+
+
+class SegmentRetranscribeWorker(QThread):
+    """Re-transcribe a single time range of an audio file with a specific
+    language forced, and emit the resulting text.
+
+    Used by the editor's right-click "Re-transcribe as…" menu. Kept
+    lightweight on purpose — we load a fresh WhisperModel for each run
+    rather than trying to share state with the main transcription
+    worker; re-transcription is a user-initiated one-off, and loading
+    the model once costs a few seconds at most on the "base" size the
+    user is likely to have open.
+
+    Signals
+    -------
+    finished_text(str) - the new text for the segment
+    failed(str)        - human-readable error message
+    """
+
+    finished_text = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        audio_path: str,
+        start: float,
+        end: float,
+        language: str,
+        model_size: str = "base",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.audio_path = audio_path
+        self.start = start
+        self.end = end
+        self.language = language
+        self.model_size = model_size
+
+    def run(self) -> None:
+        try:
+            from faster_whisper import WhisperModel
+            from faster_whisper.audio import decode_audio
+
+            model = WhisperModel(
+                self.model_size, device="auto", compute_type="auto"
+            )
+            audio = decode_audio(self.audio_path, sampling_rate=16000)
+            s_i = max(0, int(self.start * 16000))
+            e_i = min(len(audio), int(self.end * 16000))
+            if e_i <= s_i:
+                self.failed.emit("Invalid segment range")
+                return
+            chunk = audio[s_i:e_i]
+            segs, _info = model.transcribe(
+                chunk,
+                beam_size=5,
+                vad_filter=False,
+                language=self.language,
+            )
+            text = " ".join(s.text.strip() for s in segs).strip()
+            self.finished_text.emit(text)
+        except Exception as exc:
+            self.failed.emit(str(exc))

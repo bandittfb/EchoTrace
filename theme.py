@@ -18,7 +18,7 @@ ACCENT_HOVER = "#FF6B81"
 BORDER = "#2A2A4A"
 PROGRESS_BG = "#0F3460"
 PROGRESS_FILL = "#E94560"
-SEGMENT_HIGHLIGHT = "#2A1A3E"  # subtle purple for current segment
+SEGMENT_HIGHLIGHT = "#352050"  # active-segment purple — visible against the dark panel
 
 STYLESHEET = f"""
 QMainWindow, QWidget {{
